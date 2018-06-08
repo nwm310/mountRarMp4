@@ -31,7 +31,7 @@ for mp4 meta data , at least need **first part rar** and **last part rar**
 * right click on mountRarMp4.ps1  ->  Run  with PowerShell
 * if ps1  dll  rar  are not in the same folder  
 try commandline  
-mountRarMp4.ps1  -DllDir  *$Dlldir*  -rarDir  *$rarDir*
+.\mountRarMp4.ps1  -DllDir  *$Dlldir*  -rarDir  *$rarDir*
 
 * only these extension name will appear  
 mp4  avi  mpg mkv  jpg  
