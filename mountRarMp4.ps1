@@ -2,6 +2,7 @@ param($DllDir ='.', $rarDir = '.')
 #==================Edit Area================
 # Inside RAR file , only these file extension name will be process
 $Mp4ext = '\.(mp4|avi|mpg|mkv|jpg)$'
+$driveLetter = 'Z'
 $MoutName = "thanks for sharing"
 
 #============Check PS 5.0  and DLLs==============
@@ -825,7 +826,7 @@ Invoke-Expression $RarVolumeType
 #==========================Start to Mount==========================================
 $mcp = new-object Pfm+MountCreateParams -prop @{
     mountFlags = 0x30001
-    driveLetter = "Z"
+    driveLetter = $driveLetter
     mountSourceName = $MoutName  }
 
 
