@@ -20,7 +20,9 @@ if ( $dllfiles.length -ne 2 ){
 }
 
 if ( ! ('pfm' -as [type])){
-    echo "Dlls are not loaded";pause;exit
+    echo "Dlls are not loaded"
+    echo 'right click on these two dlls -> property -> unblock'
+    pause;exit
 }
 
 $pfmApi = $null
@@ -64,7 +66,7 @@ function getVint( [ref]$bPos ){
         [uint64]$d = $buffer[$bPosOld++] -band 0x7f
         $data +=  $d -shl  (7 * $n++)
     }
-    $data
+    return $data
 }
 
 function RarName4($buffer,$namePos,$nameSize){
@@ -831,7 +833,7 @@ $mcp = new-object Pfm+MountCreateParams -prop @{
 
 
 $openMp4s=@()
-for ($($i=0 ;$j=3); $i -lt $Mp4InfoAll.length;$i++,$j++){
+for ($i ,$j = 0,3; $i -lt $Mp4InfoAll.length;$i++,$j++){
     $openMp4s += 	new-object Pfm+OpenAttribs -prop @{
             openSequence = 1 ; accessLevel = [Pfm]::accessLevelReadData;
             attribs = new-object Pfm+Attribs -prop @{fileType = [Pfm]::fileTypeFile ; 
