@@ -21,7 +21,8 @@ RAR4 encryption without "Encrypt file names"
 get correct version from [Pismo File Mount Developer Kit](http://pismotec.com/download/)  
 for example :  
 pfmkit-190.zip\clr\pfmclr_190.dll  
-pfmkit-190.zip\clr\win-x64\pfmshim16_190.dll
+pfmkit-190.zip\clr\win-x64\pfmshim16_190.dll  
+**right click on these two dlls -> property -> unblock**
 * mountRarMp4.ps1
 * rar files  
 for mp4 meta data , at least need **first part rar** and **last part rar**
@@ -63,7 +64,8 @@ RAR4 一般加密(沒有檔名加密)
 從[Pismo File Mount Developer Kit](http://pismotec.com/download/)取得正確的版本  
 例如:  
 pfmkit-190.zip\clr\pfmclr_190.dll  
-pfmkit-190.zip\clr\win-x64\pfmshim16_190.dll
+pfmkit-190.zip\clr\win-x64\pfmshim16_190.dll  
+**分別在這兩個dll 按右鍵 → 內容 → 解除封鎖**
 * mountRarMp4.ps1
 * rar檔  
 Mp4檔頭、檔尾有重要資訊 , 至少要有 **第一檔** 和 **最後一檔**
