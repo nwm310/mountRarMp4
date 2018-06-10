@@ -152,6 +152,11 @@ function RarName4($buffer,$namePos,$nameSize){
 }
 
 $getHeader4 = {
+    param($fs , $buffer , $bufferPos)
+
+    $HeadTypeName = $HeadEncrypt = $HeadEnd = $PackSize = $Mp4Size =
+    $Mp4FullName = $PackType = $FileEncrypt = $FullPack = $Compression = $null
+
     $n = $fs.read($buffer , $bufferPos , 7)
     if ( $n -lt 7 ) { throw 'filesize is too small'  }
 
@@ -168,17 +173,20 @@ $getHeader4 = {
     $HeadEnd = $bufferPos + $HeadSize
 
     #=============after reading  header into buffer===============
-    $HeadTypeName = $null
     switch ($HeadType){
         0x73{
             $HeadTypeName = 'Main'
-            if (  $HeadFlag -band 0x80 ){ $HeadEncrypt = $true ; break}
+
+            if (  $HeadFlag -band 0x80 ){ 
+                $HeadEncrypt = $true ; break
+            }else{
+                $HeadEncrypt = $false
             }
+        }
 
         0x74{
             $HeadTypeName = 'File'
             
-            #=======get $Mp4Size $PackSize $Mp4FullName $PackType========
             $PackSize = [BitConverter]::ToUInt32($buffer, $bufferPos + 7 )
             $Mp4Size  = [BitConverter]::ToUInt32($buffer, $bufferPos + 11 )
 
@@ -203,17 +211,17 @@ $getHeader4 = {
             #normal pack ? first pack  ?  middle pack ? last pack ?
             $PackType = $HeadFlag -band 3
 
-            if ( $buffer[$bufferPos + 25] -ne 0x30) { $Compression = $true ;break }
-
-            if ( $PackType -eq 0 -or $PackType -eq 2 ){
-                $FullPack = $Mp4Size
+            $FullPack = $Mp4Size
+            if ($HeadFlag -band 4){
+                $FileEncrypt = $true
+                $FullPack += 16 - ($Mp4Size % 16)
             }
+
+            if ( $buffer[$bufferPos + 25] -ne 0x30) { $Compression = $true ;break }
 
             #================edit header in buffer if file is encrypted==============
             #normal pack or first pack ,  if encrypted
-            if ( ($PackType -eq 0 -or $PackType -eq 2) -and ($HeadFlag -band 4) ) {
-                $FileEncrypt = $true
-                if ( $Mp4Size % 16 ) {	$FullPack += 16 - ($Mp4Size % 16)}
+            if ( ($PackType -eq 0 -or $PackType -eq 2) -and $FileEncrypt ) {
 
                 #only get 11101110 ; some bit clear ;
                 # clear Volume attribute and New volume naming scheme ('volname.partN.rar')
@@ -249,9 +257,16 @@ $getHeader4 = {
 
         }#end of default
     }#end of switch
+    return $HeadTypeName , $HeadEncrypt , $HeadEnd , $PackSize , $Mp4Size ,
+    $Mp4FullName , $PackType , $FileEncrypt , $FullPack , $Compression
 }
 
 $getHeader5 = {
+    param($fs , $buffer , $bufferPos)
+
+    $HeadTypeName = $HeadEncrypt = $HeadEnd = $PackSize = $Mp4Size =
+    $Mp4FullName = $PackType = $FileEncrypt = $FullPack = $Compression = $null
+
     $bPos = $bufferPos
 
     #Read CRC
@@ -282,16 +297,14 @@ $getHeader5 = {
 
     $HeadFlag = getVint ([ref]$bPos)
 
-    $HeadTypeName = $null
     switch -w ($HeadType){
         #assume that data area is not exist
-        1{	$HeadTypeName = 'Main'}
+        1{	$HeadTypeName = 'Main' }
 
         [23]{	# File header or Service header
             #Extra area size
             if ( $HeadFlag -band 1 ) {getVint ([ref]$bPos) > $null }
 
-            #=======get $Mp4Size $PackSize  $Mp4FullName  $PackType========
             #Data area size
             $PackSize = 0
             if ( $HeadFlag -band 2 ) {
@@ -323,7 +336,6 @@ $getHeader5 = {
             if ($FileFlags -band 4) {$bPos +=4}
 
             #Compression information
-            #can't break , need to get more infomation
             if (  (getVint ([ref]$bPos)) -band 0x0380){ $Compression = $true }
 
             #Host OS
@@ -339,35 +351,30 @@ $getHeader5 = {
             #normal pack ? first pack  ?  middle pack ? last pack ?
             $PackType = ($HeadFlag -shr 3) -band 3
 
-            if ( $PackType -eq 0 -or $PackType -eq 2 ){
-                $FullPack = $Mp4Size
-            }
+            $FullPack = $Mp4Size
 
-            if ( $Compression ) {break}
+            #encrypt ?  read extra area
+            $FileEncrypt = $false
+            while ( $bPos -lt $HeadEnd ){
+                $recordSize = getVint ([ref]$bPos)
+                if ( $bPos -ge $HeadEnd ){break}
+                                
+                $recordEnd = $bPos + $recordSize
             
-            #encrypt ?
-            if ( $PackType -eq 0 -or $PackType -eq 2 ) {
-                #read extra area
-                while ( $bPos -lt $HeadEnd ){
-                    $recordSize = getVint ([ref]$bPos)
-                    if ( $bPos -ge $HeadEnd ){break}
-                    
-                    $recordEnd = $bPos + $recordSize
-
-                    #record type
-                    if ( ( getVint ([ref]$bPos) ) -eq 1 ){
-                        $FileEncrypt = $true
-                        break
-                    }else{
-                        $bPos = $recordEnd
-                    }
-                }#end of while
-            }#end of if    
+                #record type
+                if ( ( getVint ([ref]$bPos) ) -eq 1 ){
+                    $FileEncrypt = $true ; break
+                }else{
+                    $bPos = $recordEnd
+                }
+            }#end of while            
         }#end of [23]
 
         4{	$HeadEncrypt = $true }
 
     }# end of switch
+    return $HeadTypeName , $HeadEncrypt , $HeadEnd , $PackSize , $Mp4Size ,
+    $Mp4FullName , $PackType , $FileEncrypt , $FullPack , $Compression
 }
 #-----------------------------------------------------
 $nextRarN = $null
@@ -400,20 +407,24 @@ $Rar | %{
     } else {
         $fs.close(); echo "$_ is not RAR";return
     }
-
+    
     #=============read main header===============
-    $HeadEncrypt = $false
-    . $getHeader
-    $bufferPos = $HeadEnd
+    $result = & $getHeader $fs  $buffer  $bufferPos
+    #$HeadTypeName , $HeadEncrypt , $HeadEnd , $PackSize , $Mp4Size ,
+    #$Mp4FullName , $PackType , $FileEncrypt , $FullPack , $Compression
+    
+    $HeadTypeName , $HeadEncrypt , $bufferPos = $result[0..2]
 
     if ($HeadEncrypt){ $fs.close();echo " can't process files which `"Encrypt file names`"";pause;exit }
-
-    if ($HeadTypeName -ne 'Main') {$fs.close(); echo "$_ header error";return}
     
+    if ($HeadTypeName -ne 'Main') {$fs.close(); echo "$_ header error";return}
+
     #==============read file header==============
     while ($fs.Position -lt $fs.length ){
-        $Compression = $FileEncrypt = $false 
-         . $getHeader
+        $result = & $getHeader $fs  $buffer  $bufferPos
+
+        $HeadTypeName , $HeadEncrypt , $HeadEnd , $PackSize , $Mp4Size ,
+        $Mp4FullName , $PackType , $FileEncrypt , $FullPack , $Compression = $result[0..9]
 
         if ( $HeadTypeName -ne 'File' ) { continue }
 
@@ -431,7 +442,7 @@ $Rar | %{
             }
 
             *{#previous pack and current pack are not  parts of the same file
-                echo "$Mp4FullName_now incomplete"
+                echo "$Mp4FullName_now`nincomplete"
                 $Mp4Info[0].Mp4Size = $Mp4offset
                 $Mp4InfoALL+= ,$Mp4Info
                 $Mp4Info =  @()
@@ -443,10 +454,10 @@ $Rar | %{
             [02]{  #normal pack  or first pack
 
                 #skip files which are compressed
-                if ( $compression ) { echo "can't process compressed file";break}
+                if ( $compression ) { echo "$Mp4FullName`ncan't process compressed file";break}
 
                 #skip files which are RAR 5 and encrypted
-                if ($rarVer -eq 5 -and $FileEncrypt ) {echo "can't process encrypted RAR 5 file";break}
+                if ($rarVer -eq 5 -and $FileEncrypt ) {echo "$Mp4FullName`ncan't process encrypted RAR 5 file";break}
 
                 #skip files which are not MP4 
                 if ( $Mp4FullName -notmatch $Mp4ext ) {break}
@@ -507,7 +518,7 @@ $Rar | %{
                     $Mp4Info[0].Mp4Size = $Mp4offset
                     $Mp4InfoALL+= ,$Mp4Info
                     $Mp4Info =  @()
-                    if ( $nEmpty -gt 0 ) {echo "$Mp4FullName_now incomplete"}
+                    if ( $nEmpty -gt 0 ) {echo "$Mp4FullName`nincomplete"}
                 }
 
             }#end of [02]
@@ -552,12 +563,12 @@ $Rar | %{
                     $nextRarN = $nPart + 1
                 } else { # last pack
                     if ( $nEmpty -gt 0 ) {
-                        echo "$Mp4FullName_now incomplete"
+                        echo "$Mp4FullName`nincomplete"
                         $Mp4Info[0].Mp4Size = $Mp4offset
                     }
                     $Mp4InfoALL+= ,$Mp4Info
                     $Mp4Info =  @()
-                    $nextRarN = $null
+                    $nextRarN = $Mp4FullName_now =$null
                 }
             }#end of [13]
         }# end of switch
@@ -582,7 +593,7 @@ $Rar | %{
 $fs.close()
 }
 if ( $nextRarN -ne $null ) {
-    echo "$Mp4FullName_now incomplete"
+    echo "$Mp4FullName`nincomplete"
     $Mp4Info[0].Mp4Size = $Mp4offset
     $Mp4InfoALL+= ,$Mp4Info
     $Mp4Info =  @()
