@@ -29,7 +29,7 @@ for mp4 meta data , at least need **first part rar** and **last part rar**
 IF **first part rar** is missing and **last part rar**(contins moov) exist , it will try to rebuild mp4 header
 
 ## Usage
-* **put these files in the same folder**
+* **put these files(pfmclr_190.dll、pfmshim16_190.dll、mountRarMp4.ps1、rar files ) in the same folder**
 * right click on mountRarMp4.ps1  ->  Run  with PowerShell
 * if ps1  dll  rar  are not in the same folder  
 try commandline  
@@ -68,7 +68,7 @@ Mp4檔頭、檔尾有重要資訊 , 至少要有 **第一檔** 和 **最後一�
 如果沒有**第一檔**，而**最後一檔**(內含moov資訊)存在，會試著去重建Mp4檔頭
 
 ## 使用方法
-* **把上述這些檔案放到同一個資料夾**
+* **把上述這些檔案(pfmclr_190.dll、pfmshim16_190.dll、mountRarMp4.ps1、rar檔 )放到同一個資料夾**
 * mountRarMp4.ps1 -> 右鍵 ->  用 PowerShell 執行
 * 如果 ps1  dll  rar  不在同一個資料夾  
 可用命令行  
