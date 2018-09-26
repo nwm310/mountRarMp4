@@ -1,7 +1,5 @@
 param($DllDir ='.', $rarDir = '.')
 #==================Edit Area================
-# Inside RAR file , only these file extension name will be process
-$Mp4ext = '\.(mp4|avi|mpg|mkv|jpg)$'
 $driveLetter = 'Z'
 $MoutName = "thanks for sharing"
 
@@ -53,20 +51,29 @@ if ( $Rar -eq $null ) {echo 'RAR not found' ;pause;exit}
 #====================Functions=====================
 function getVint( [ref]$bPos ){
     $bPosOld = $bPos.Value
-    do {
-        $bPos.Value++
-    }while ( $buffer[$bPos.Value - 1] -band 0x80 )
+
+    while ( $buffer[$bPos.Value++] -band 0x80 ) {}
 
     if ( ($bPos.Value - $bPosOld) -gt 9 ){throw 'Vint : too many bytes'}  # 7 * 9 = 63
 
     $data = $n = 0
 
     while ( $bPosOld -lt $bPos.Value ) {
-
-        [uint64]$d = $buffer[$bPosOld++] -band 0x7f
+        [uint64]$d = $buffer[$bPosOld++] -band 0x7F
         $data +=  $d -shl  (7 * $n++)
     }
     return $data
+}
+
+function getVint2 ( $n ){
+    [byte[]]$databyte = @()
+    while ($n){
+        $a = $n -band 0x7F
+        $n = $n -shr 7
+        if ( $n ){ $a += 0x80 }
+        $databyte += $a
+    }
+    return $databyte
 }
 
 function RarName4($buffer,$namePos,$nameSize){
@@ -94,8 +101,8 @@ function RarName4($buffer,$namePos,$nameSize){
 
     :out
     While ($i -lt $nameEnd){
-        #every 4 circle , $FlagBit -eq 0 , read a byte into $Flags
-        #There are 4 flags in $Flags
+        #every 4 times , $FlagBit become 0 , read a byte into $Flags
+        #There are 4 flags(2bit)  in  $Flags
         if ($FlagBits -eq 0){
             $Flags = $buffer[$i++]
             $FlagBits = 8
@@ -178,7 +185,7 @@ $getHeader4 = {
             $HeadTypeName = 'Main'
 
             if (  $HeadFlag -band 0x80 ){ 
-                $HeadEncrypt = $true ; break
+                $HeadEncrypt = $true
             }else{
                 $HeadEncrypt = $false
             }
@@ -303,7 +310,9 @@ $getHeader5 = {
 
         [23]{	# File header or Service header
             #Extra area size
-            if ( $HeadFlag -band 1 ) {getVint ([ref]$bPos) > $null }
+            if ( $HeadFlag -band 1 ) {getVint ([ref]$bPos) > $null 
+                                $extraSizeEnd = $bPos
+            }
 
             #Data area size
             $PackSize = 0
@@ -319,6 +328,7 @@ $getHeader5 = {
                 $fs.Position += $PackSize
                 break
             }
+            $packSizeEnd = $bPos
 
             #File flags
             $FileFlags = getVint ([ref]$bPos)
@@ -363,11 +373,32 @@ $getHeader5 = {
             
                 #record type
                 if ( ( getVint ([ref]$bPos) ) -eq 1 ){
-                    $FileEncrypt = $true ; break
+                    $FileEncrypt = $true
+                    $FullPack += 16 - ($Mp4Size % 16)
+                    break
                 }else{
                     $bPos = $recordEnd
                 }
-            }#end of while            
+            }#end of while
+            #================edit header in buffer if file is encrypted============
+            #normal pack or first pack ,  if encrypted
+            if ( ($PackType -eq 0 -or $PackType -eq 2) -and $FileEncrypt ) {
+                                                    #size , type , flags , Archive flags
+                [byte[]]$editBuffer = $buffer[0..11] + 3,1,0,0  +
+                                    $buffer[$bufferPos .. ($bufferPos+3) ]
+                
+                #type,flags,extraSize
+                [byte[]]$data1 = $buffer[$HeadSizePosEnd .. ($extraSizeEnd -1)  ]
+                $data1[1] = 3  #flags
+                $data1 += getVint2 $FullPack  #data size
+                $data1 += $buffer[$packSizeEnd .. ($HeadEnd -1) ] # after data size
+
+                $editBuffer += (getVint2 $data1.Length) + $data1
+                $HeadEnd = $editBuffer.Length
+
+                [array]::copy($editBuffer , 0 , $buffer , 0 , $HeadEnd )
+            }#end of if
+
         }#end of [23]
 
         4{	$HeadEncrypt = $true }
@@ -382,7 +413,7 @@ $Mp4Info = @()
 $Mp4InfoALL = @()
 $Mp4NameList = @()
 
-$buffer = new-object byte[](10kb)
+$buffer = new-object byte[](20kb)
 
 $Rar | %{
     trap{ $fs.close() ; return }	
@@ -442,46 +473,55 @@ $Rar | %{
             }
 
             *{#previous pack and current pack are not  parts of the same file
-                echo "$Mp4FullName_now`nincomplete"
-                $Mp4Info[0].Mp4Size = $Mp4offset
-                $Mp4InfoALL+= ,$Mp4Info
+                if ( $Mp4Info[0] -ne $null ){
+                    echo "$Mp4FullName_now`nincomplete"
+                    $Mp4Info[0].Mp4Size = $Mp4offset
+                    $Mp4NameList += $Mp4Name
+                    $Mp4InfoALL+= ,$Mp4Info
+                }else{
+                    $Mp4Info | %{
+                        if ( $_.fs -ne $null ){ $_.fs.close() }
+                    }
+                }
+                
                 $Mp4Info =  @()
                 $nextRarN = $null
             }
         }#end of switch
         #=====================process current pack=====================================
         switch -w  ( $PackType ) {
-            [02]{  #normal pack  or first pack
-
+            {$nextRarN  -eq $null }{
                 #skip files which are compressed
                 if ( $compression ) { echo "$Mp4FullName`ncan't process compressed file";break}
-
-                #skip files which are RAR 5 and encrypted
-                if ($rarVer -eq 5 -and $FileEncrypt ) {echo "$Mp4FullName`ncan't process encrypted RAR 5 file";break}
-
-                #skip files which are not MP4 
-                if ( $Mp4FullName -notmatch $Mp4ext ) {break}
-
+                
                 #skip filesize -eq 0   or folder
                 if ( $Mp4Size -eq 0 ){break }
+
+                
+                if ( $_ -like '[13]' ) {
+                    if ( $Mp4FullName -notmatch '\.mp4$' -or $FileEncrypt ) { break }
+                    $Mp4Info += $null,$null
+                }
+
+                $Mp4offset = 0
+                if ($_ -eq 1 ){ $Mp4offset = $FullPack - $PackSize }
+                if ($_ -eq 3 ){ $midPackSize = $PackSize }
 
                 #check duplicate names
                 $Mp4Name = split-path  $Mp4FullName  -leaf
                 
                 if ( $FileEncrypt ){ $Mp4Name += '.rar' }
-                
+                                                
                 $n = 1
                 $Mp4BaseName = [IO.Path]::GetFileNameWithoutExtension($Mp4Name)
                 $Mp4ExtName = [IO.Path]::GetExtension($Mp4Name)
                 while ($Mp4NameList -contains $Mp4Name){
-                   $Mp4Name = $Mp4BaseName + '-' + $n + $Mp4ExtName
-                   $n++
+                    $Mp4Name = $Mp4BaseName + '-' + $n + $Mp4ExtName
+                    $n++
                 }
-                $Mp4NameList += $Mp4Name
 
-                $Mp4offset = 0
-                #(for RAR 4 )  if encrypt , add RAR signature and main header to Mp4info
-                if ( $FileEncrypt ){
+                # if encrypt , add RAR signature and main header to Mp4info
+                if ( $_ -like '[02]' -and $FileEncrypt ){
 
                     $Mp4Info += @{fs = $null ; buffer = $null
                         Mp4offset = $Mp4offset	; length = $HeadEnd ; RARoffset = 0
@@ -494,7 +534,6 @@ $Rar | %{
                     $Mp4offset += $HeadEnd
 
                     echo 'Use WinRAR to Open and Extract with "keep broken extracted files" option'
-                            
                 }
                 #======================================================================
                 $nEmpty = 0
@@ -509,28 +548,17 @@ $Rar | %{
 
                 $Mp4offset += $PackSize - $nEmpty
 
-                if ($_ -eq 2) { # first pack
+                #=========================================================
+                if ( $_ -like '[23]' ) { # first pack or middle pack
                     #next RAR file number
                     $nextRarN = 1 + $( $a.basename -replace '.*part','' )
                     $Mp4FullName_now = $Mp4FullName
                     $Mp4Size_now = $Mp4Size
-                } else { # normal pack
-                    $Mp4Info[0].Mp4Size = $Mp4offset
-                    $Mp4InfoALL+= ,$Mp4Info
-                    $Mp4Info =  @()
-                    if ( $nEmpty -gt 0 ) {echo "$Mp4FullName`nincomplete"}
-                }
-
-            }#end of [02]
-
-            [13]{ #middle pack  or last pack
-                #previous pack and current pack are parts of the same file ?
-                if ( $nextRarN -eq $null -or
-                     $Mp4FullName_now -ne $Mp4FullName -or
-                     $Mp4Size_now -ne $Mp4Size){
                     break
-                }
+                } 
+            } # end of $nextRarN  -eq $null
 
+            { $nextRarN  -ne $null }{
                 [int]$nPart = $a.basename -replace '.*part',''
 
                 # missing *.part.rar  or previous pack is not complete
@@ -539,16 +567,22 @@ $Rar | %{
                         $nEmpty = $PackSize * ( $nPart - $nextRarN ) +  $nEmpty
                         $Mp4Info += @{fs = $null ; Mp4offset = $Mp4offset;length = $nEmpty}
                         $Mp4offset += $nEmpty
-
                     }else{ # last pack
-                        $nEmpty = $Mp4Info[0].Mp4Size - $PackSize - $Mp4offset
-                        $Mp4Info += @{fs = $null ; Mp4offset = $Mp4offset;length = $nEmpty}
-                        $Mp4offset = $Mp4Info[0].Mp4Size - $PackSize
+                        if ( $Mp4Info[0] -ne $null ){
+                            $nEmpty = $Mp4Info[0].Mp4Size -$PackSize - $Mp4offset
+                            $Mp4Info += @{fs = $null ; Mp4offset = $Mp4offset;length = $nEmpty}
+                            $Mp4offset = $Mp4Info[0].Mp4Size - $PackSize
+                        }else{
+                            $nEmpty = $midPackSize * ( $nPart - $nextRarN ) +  $nEmpty
+                            $Mp4Info += @{fs = $null ; Mp4offset = $Mp4offset;length = $nEmpty}
+                            $Mp4offset = $FullPack - $PackSize
+                        }
+                        
                     }
-
-                    $nEmpty = 0
                 }
 
+                if ( $_ -eq 1 -and $Mp4Info[0] -eq $null ) { $Mp4offset = $FullPack - $PackSize }
+                $nEmpty = 0
                 #file is incomplete ?
                 if (  ($fs.Position + $PackSize) -gt $fs.length  ) {
                     $nEmpty = $fs.Position + $PackSize - $fs.length
@@ -558,45 +592,157 @@ $Rar | %{
                     RARoffset = $fs.Position ; length = $PackSize - $nEmpty}
 
                 $Mp4offset += $PackSize - $nEmpty
+                    
+                #middle pack
+                if ($_ -eq 3){ $nextRarN = $nPart + 1 ; break }
+            } #end of $nextRarN  -ne $null 
 
-                if ($_ -eq 3){ #middle pack
-                    $nextRarN = $nPart + 1
-                } else { # last pack
-                    if ( $nEmpty -gt 0 ) {
-                        echo "$Mp4FullName`nincomplete"
-                        $Mp4Info[0].Mp4Size = $Mp4offset
+            [01]{
+                if ($Mp4Info[0] -eq $null ){
+                    write-host searching moov
+                    $time1=get-date
+                    # find moov
+                    $searchSize = 20MB
+                    if ( $FullPack -lt $searchSize ){ $searchSize = $FullPack }
+
+                    $buffer2 = new-object byte[]( $searchSize )
+                    $buffer2End = $searchSize - $nEmpty ; $i = $Mp4Info.length -1
+                    while( $buffer2End -gt 0 ){
+                        if ( $Mp4Info[$i].fs -eq $null ) { break }
+
+                        $L = 0
+                        if ( $Mp4Info[$i].length -gt $buffer2End ){
+                            $L = $Mp4Info[$i].length - $buffer2End
+                        }
+                        $Mp4Info[$i].fs.position = $Mp4Info[$i].RARoffset + $L
+                        $buffer2End -= $Mp4Info[$i].length - $L
+                        [void]$Mp4Info[$i].fs.read( $buffer2 , $buffer2End  ,$Mp4Info[$i].length - $L )
+                        $i--
                     }
-                    $Mp4InfoALL+= ,$Mp4Info
-                    $Mp4Info =  @()
-                    $nextRarN = $Mp4FullName_now =$null
+                    
+                    $buffer2start = $buffer2End
+                    #search range : $buffer2start  to ($searchSize - $nEmpty)
+                    [byte[]]$pattern = 0x6D ,0x6F ,0x6F ,0x76 ,0 ,0 ,0 ,0x6C ,0x6D ,0x76 ,0x68 ,0x64
+                    
+                    if ( $buffer2start -lt 0 -or
+                    $searchSize - $nEmpty - $buffer2start -lt $pattern.length ){
+                        $moovPos = -1
+                    }else{
+                        [byte[]]$B = @(12) * 256
+                        ($pattern.Length - 1) .. 1 | %{ $B[ $pattern[$_] ] = $_ }
+                        [byte[]]$G = 1,8 + @(12) * 10
+
+                        $buffer2Pos = $searchSize - $nEmpty  - $pattern.length
+
+                        while ( $buffer2Pos -ge $buffer2start ){
+                            for ($i = 0 ; $i -lt $pattern.length -and $pattern[$i] -eq $buffer2[$buffer2Pos + $i] ; $i++){}
+                        
+                            if ($i -eq $pattern.length){
+                                break
+                            }else{
+                                if ( $i -eq 0 ){
+                                    $buffer2Pos -= $B[  $buffer2[$buffer2Pos] ]
+                                }else{
+                                    $buffer2Pos -= $G[ $i ]
+                                }
+                            }
+                        }#end of while 
+                        
+                        if ($buffer2Pos -lt $buffer2start ){
+                            $moovPos = -1 ; write-host moov not found
+                        }else{
+                            $moovPos = $FullPack - $searchSize + $buffer2Pos - 4
+                            write-host moov found
+                        }
+                        $buffer2 = $null
+                        $time2=get-date
+                        write-host ($time2-$time1)
+                    }# end of if
+                    #========================after searching========================
+
+                    if ( $moovPos -eq -1 ) { # moov not find
+                        $Mp4Info | %{
+                            if ( $_.fs -ne $null ){ $_.fs.close() }
+                        }
+                        $Mp4Info =  @()
+                        $nextRarN = $null
+                        break
+                    }else{ #moov found
+                        [byte[]]$ftypData = 0,0,0,0x20,0x66,0x74,0x79,0x70,0x69,0x73,0x6F,0x6D,0,0,
+                                            2,0,0x69,0x73,0x6F,0x6D,0x69,
+                                            0x73,0x6F,0x32,0x61,0x76,0x63,0x31,0x6D,0x70,0x34,0x31
+                        $mdatSize = $moovPos - 32
+                        if ( $mdatSize -lt 4GB ){
+                            $arr = [BitConverter]::GetBytes([uint32]$mdatSize)
+                            [array]::Reverse($arr)
+                            [byte[]]$mdatHead = $arr + 0x6D,0x64,0x61,0x74
+                        }else{
+                            $arr = [BitConverter]::GetBytes([uint64]$mdatSize)
+                            [array]::Reverse($arr)
+                            [byte[]]$mdatHead = 0,0,0,1 + 0x6D,0x64,0x61,0x74 + $arr
+                        }
+                        
+                        $L = $ftypData.Length + $mdatHead.length
+                        $Mp4Info[0] = @{fs = $null ; buffer = $null
+                            Mp4offset = 0 ; length = $L ; RARoffset = 0
+                            Mp4Name = $Mp4Name ; Mp4Size = $FullPack}
+                        
+                        $Mp4Info[0].buffer = new-object byte[]($L)
+                        [array]::copy($ftypData,0,$Mp4Info[0].buffer, 0 , $ftypData.Length )
+                        [array]::copy($mdatHead,0,$Mp4Info[0].buffer, $ftypData.Length , $mdatHead.Length )
+                        $Mp4Info[0].fs = new-object IO.MemoryStream($Mp4Info[0].buffer,0, $L)
+
+                        $Mp4Info[1] = @{fs = $null ; Mp4offset = $L ; length = $null }
+    
+                        if ( $Mp4Info.Length -gt 3 ){
+                            $L = $FullPack - $PackSize - ( $Mp4Info[-2].Mp4offset + $Mp4Info[-2].length )
+                            2 .. ($Mp4Info.Length - 2) | %{ $Mp4Info[$_].Mp4offset += $L }
+                        }
+                        $Mp4Info[1].length = $Mp4Info[2].Mp4offset - $Mp4Info[1].Mp4offset
+                    }#end of moov found
+                }# end of if $mp4Info[0]
+                
+                if ( $nEmpty -gt 0 ) {
+                    echo "$Mp4FullName`nincomplete"
+                    $Mp4Info[0].Mp4Size = $Mp4offset
                 }
-            }#end of [13]
+
+                $Mp4NameList += $Mp4Name
+                $Mp4InfoALL+= ,$Mp4Info
+                $Mp4Info = @()
+                $nextRarN = $null
+            }#end of [01]
         }# end of switch
-        #========IS this block  the last block need to be processed in this file ? =========
+        #========Is this block  the last block need to be processed in this file ? =========
         switch -w  ( $PackType ) {
             #First pack  or Middle pack
             #After this block , no content in this  file need to be processed
-            [23]{ $fs.close();return }
+            [23]{ $fs.close() ; return }
 
             [01]{ # normal pack  or last pack
-                $nEmpty = 0
                 if (  ($fs.Position + $PackSize) -gt $fs.length  ) {
-                    $nEmpty = $fs.Position + $PackSize - $fs.length
+                    $fs.close() ; return
+                }else{
+                    $fs.Position += $PackSize
                 }
-    
-                if ( $nEmpty -eq 0 ) {$fs.Position += $PackSize
-                     } else { $fs.close();return }
-
             }
         } # end of switch
     } # end of while
-$fs.close()
+$fs.close()  ; $buffer = $null
 }
 if ( $nextRarN -ne $null ) {
-    echo "$Mp4FullName`nincomplete"
-    $Mp4Info[0].Mp4Size = $Mp4offset
-    $Mp4InfoALL+= ,$Mp4Info
+    if ( $Mp4Info[0] -ne $null ){
+        echo "$Mp4FullName_now`nincomplete"
+        $Mp4Info[0].Mp4Size = $Mp4offset
+        $Mp4NameList += $Mp4Name
+        $Mp4InfoALL+= ,$Mp4Info
+    }else{
+        $Mp4Info | %{
+            if ( $_.fs -ne $null ){ $_.fs.close() }
+        }
+    }
     $Mp4Info =  @()
+    $nextRarN = $null
 }
 if ( $Mp4InfoALL.length -eq 0) {echo 'mp4 not found';pause;exit}
 #====================================================================================
