@@ -25,7 +25,7 @@ pfmkit-190.zip\clr\win-x64\pfmshim16_190.dll
 **right click on these two dlls -> property -> unblock**
 * mountRarMp4.ps1
 * rar files  
-for mp4 meta data , at least need **first part rar** and **last part rar**
+for mp4 meta data , at least need **first part rar** and **last part rar**  
 IF **first part rar** is missing and **last part rar**(contins moov) exist , it will try to rebuild mp4 header
 
 ## Usage
@@ -64,7 +64,7 @@ pfmkit-190.zip\clr\win-x64\pfmshim16_190.dll
 **分別在這兩個dll 按右鍵 → 內容 → 解除封鎖**
 * mountRarMp4.ps1
 * rar檔  
-Mp4檔頭、檔尾有重要資訊 , 至少要有 **第一檔** 和 **最後一檔**
+Mp4檔頭、檔尾有重要資訊 , 至少要有 **第一檔** 和 **最後一檔**  
 如果沒有**第一檔** 而**最後一檔**存在(內含moov資訊)，會試著去重建檔頭
 
 ## 使用方法
