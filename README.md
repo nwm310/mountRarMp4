@@ -9,8 +9,8 @@ even if some  *.part.rar is missing  or download incomplete
 * Compression : Store Only
 * Encryption : NO Encryption  
 or  
-RAR4 encryption without "Encrypt file names"  
-(rar will appear  instead of mp4 ,  Open it with WinRAR and Extract with "keep broken extracted files" option)
+encryption without "Encrypt file names"  
+(Instead of mp4 , rar will appear.  Open it with WinRAR and Extract with "keep broken extracted files" option)
 
 ## Environment
 * Windows
@@ -34,11 +34,6 @@ for mp4 meta data , at least need **first part rar** and **last part rar**
 try commandline  
 .\mountRarMp4.ps1  -DllDir  *$Dlldir*  -rarDir  *$rarDir*
 
-* only these extension name will appear  
-mp4  avi  mpg mkv  jpg  
-for more extension name , you can edit  mountRarMp4.ps1  
-$Mp4ext = '\.(mp4|avi|mpg|mkv|jpg)$'
-
 ***
 # mountRarMp4
 
@@ -51,7 +46,7 @@ $Mp4ext = '\.(mp4|avi|mpg|mkv|jpg)$'
 * 壓縮方式 : 僅儲存
 * 加密方式 : 沒有加密  
 or  
-RAR4 一般加密(沒有檔名加密)  
+R一般加密(沒有檔名加密)  
 掛載的結果會是RAR檔。  
 用WinRAR打開它、解壓縮。「保留毀損的檔案」的選項要打勾
 
@@ -77,7 +72,3 @@ Mp4檔頭、檔尾有重要資訊 , 至少要有 **第一檔** 和 **最後一�
 可用命令行  
 .\mountRarMp4.ps1  -DllDir  *$Dlldir*  -rarDir  *$rarDir*
 
-* 掛載的結果，只有這些副檔名會顯示  
-mp4  avi  mpg mkv  jpg  
-如果要顯示更多副名，可以修改 mountRarMp4.ps1  
-$Mp4ext = '\.(mp4|avi|mpg|mkv|jpg)$'
