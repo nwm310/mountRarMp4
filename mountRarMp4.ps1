@@ -171,6 +171,8 @@ $getHeader4 = {
     $HeadFlag = [BitConverter]::ToUInt16($buffer , $bufferPos + 3 )
     $HeadSize = [BitConverter]::ToUInt16($buffer , $bufferPos + 5 )
 
+    if ($HeadSize -eq 0 ){throw 'header error'}
+
     $n = $HeadSize - 7
     if ( $n -gt 0 ) {
         $n1 = $fs.read($buffer , $bufferPos + 7 , $n )
@@ -288,6 +290,7 @@ $getHeader5 = {
     if ( $n -lt 3 ) { throw 'file size too small' }
 
     $HeadSize = getVint ([ref]$bPos)
+    if ($HeadSize -eq 0 ){throw 'header error'}
     $HeadSizePosEnd  = $bPos
     
 
@@ -523,13 +526,11 @@ $Rar | %{
                 # if encrypt , add RAR signature and main header to Mp4info
                 if ( $_ -like '[02]' -and $FileEncrypt ){
 
-                    $Mp4Info += @{fs = $null ; buffer = $null
+                    $Mp4Info += @{fs = new-object IO.MemoryStream
                         Mp4offset = $Mp4offset	; length = $HeadEnd ; RARoffset = 0
                         Mp4Name = $Mp4Name ; Mp4Size = $HeadEnd + $FullPack}
 
-                    $Mp4Info[0].buffer = new-object byte[]($HeadEnd)
-                    [array]::copy($buffer,0,$Mp4Info[0].buffer, 0 , $HeadEnd )
-                    $Mp4Info[0].fs = new-object IO.MemoryStream($Mp4Info[0].buffer,0, $HeadEnd)
+                    $Mp4Info[0].fs.write($buffer , 0 , $HeadEnd)
 
                     $Mp4offset += $HeadEnd
 
@@ -671,7 +672,7 @@ $Rar | %{
                         [byte[]]$ftypData = 0,0,0,0x20,0x66,0x74,0x79,0x70,0x69,0x73,0x6F,0x6D,0,0,
                                             2,0,0x69,0x73,0x6F,0x6D,0x69,
                                             0x73,0x6F,0x32,0x61,0x76,0x63,0x31,0x6D,0x70,0x34,0x31
-                        $mdatSize = $moovPos - 32
+                        $mdatSize = $moovPos - $ftypData.Length
                         if ( $mdatSize -lt 4GB ){
                             $arr = [BitConverter]::GetBytes([uint32]$mdatSize)
                             [array]::Reverse($arr)
@@ -683,15 +684,13 @@ $Rar | %{
                         }
                         
                         $L = $ftypData.Length + $mdatHead.length
-                        $Mp4Info[0] = @{fs = $null ; buffer = $null
+                        $Mp4Info[0] = @{fs = new-object IO.MemoryStream
                             Mp4offset = 0 ; length = $L ; RARoffset = 0
                             Mp4Name = $Mp4Name ; Mp4Size = $FullPack}
-                        
-                        $Mp4Info[0].buffer = new-object byte[]($L)
-                        [array]::copy($ftypData,0,$Mp4Info[0].buffer, 0 , $ftypData.Length )
-                        [array]::copy($mdatHead,0,$Mp4Info[0].buffer, $ftypData.Length , $mdatHead.Length )
-                        $Mp4Info[0].fs = new-object IO.MemoryStream($Mp4Info[0].buffer,0, $L)
 
+                        $Mp4Info[0].fs.write($ftypData , 0 , $ftypData.Length)
+                        $Mp4Info[0].fs.write($mdatHead , 0 , $mdatHead.Length)
+                        
                         $Mp4Info[1] = @{fs = $null ; Mp4offset = $L ; length = $null }
     
                         if ( $Mp4Info.Length -gt 3 ){
