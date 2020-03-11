@@ -7,10 +7,6 @@ even if some  *.part.rar is missing  or download incomplete
 ## RAR format
 * file format : RAR4 or RAR5
 * Compression : Store Only
-* Encryption : NO Encryption  
-or  
-encryption without "Encrypt file names"  
-(Instead of mp4 , rar will appear.  Open it with WinRAR and Extract with "keep broken extracted files" option)
 
 ## Environment
 * Windows
@@ -31,9 +27,6 @@ IF **first part rar** is missing and **last part rar**(contins moov) exist , it 
 ## Usage
 * **put these files(pfmclr_190.dll、pfmshim16_190.dll、mountRarMp4.ps1、rar files ) in the same folder**
 * right click on mountRarMp4.ps1  ->  Run  with PowerShell
-* if ps1  dll  rar  are not in the same folder  
-try commandline  
-.\mountRarMp4.ps1  -DllDir  *$Dlldir*  -rarDir  *$rarDir*
 
 ***
 # mountRarMp4
@@ -45,11 +38,6 @@ try commandline
 ## RAR格式(需符合以下條件)
 * RAR版本 : RAR4 或 RAR5
 * 壓縮方式 : 僅儲存
-* 加密方式 : 沒有加密  
-or  
-一般加密(沒有檔名加密)  
-此時，掛載的結果不是Mp4，而是RAR檔。
-用WinRAR打開它、解壓縮。「保留毀損的檔案」的選項要打勾
 
 ## 環境
 * Windows
@@ -70,7 +58,5 @@ Mp4檔頭、檔尾有重要資訊 , 至少要有 **第一檔** 和 **最後一�
 ## 使用方法
 * **把上述這些檔案(pfmclr_190.dll、pfmshim16_190.dll、mountRarMp4.ps1、rar檔 )放到同一個資料夾**
 * mountRarMp4.ps1 -> 右鍵 ->  用 PowerShell 執行
-* 如果 ps1  dll  rar  不在同一個資料夾  
-可用命令行  
-.\mountRarMp4.ps1  -DllDir  *$Dlldir*  -rarDir  *$rarDir*
+
 
