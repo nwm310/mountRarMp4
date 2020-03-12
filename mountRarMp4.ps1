@@ -794,6 +794,9 @@ function getAESKeyIV ($h, $salt, $rar5E = $null){
         $script:pass = read-host 'password ?'
     }
 
+    #https://github.com/lclevy/unarcrypto
+    #https://stackoverflow.com/questions/18648084/rfc2898-pbkdf2-with-sha256-as-digest-in-c-sharp
+
     if ($h.rarVer -eq 4){
         $seed = [System.Text.Encoding]::Unicode.GetBytes($script:pass) + $salt
         $seedNew = New-Object byte[] $seed.length
@@ -1105,7 +1108,7 @@ function parseFileHeader($getHeader, $h, $fs, $buffer, $file, $HeadEncrypt){
         $n = 1
         $Mp4BaseName = [IO.Path]::GetFileNameWithoutExtension($Mp4Name)
         $Mp4ExtName = [IO.Path]::GetExtension($Mp4Name)
-        #if ($Mp4ExtName -notIn $script:videoExtName){return $PackType, $PackOffset, $PackSize}
+        
         while ($script:Mp4NameList -contains $Mp4Name){
             $Mp4Name = $Mp4BaseName + '-' + $n + $Mp4ExtName
             $n++
@@ -1844,7 +1847,7 @@ function mp4Ending($h){
     
     $script:Mp4NameList += $Mp4Info[0].Mp4Name
     $script:Mp4InfoList += ,$Mp4Info
-
+    
     $h.nextPartN = $null
 }
 
@@ -1940,19 +1943,44 @@ RarVolume(){
         $existed = $true
         $openAttribs = $this.openRoot
 
-    }elseif($op.NameParts().Length -eq 1){
+    }elseif($op.NameParts().Length -lt 3){
+
             for ($i=0; $i -lt $this.Mp4InfoList.count; $i++){
-                if($op.NameParts()[0].ToLowerInvariant() -eq $this.Mp4InfoList[$i][0].Mp4Name.ToLowerInvariant()){
-                    if ($this.openMp4s[$i].openId -eq 0) {$this.openMp4s[$i].openId = $op.NewExistingOpenId() }
-                    $existed = $true
-                    $endName = $this.Mp4InfoList[$i][0].Mp4Name
-                    $openAttribs = $this.openMp4s[$i]
-                    break
+                if ($null -eq $this.Mp4InfoList[$i][0].parents){
+                    if($op.NameParts()[0].ToLowerInvariant() -eq $this.Mp4InfoList[$i][0].Mp4Name.ToLowerInvariant()){
+                        break
+                    }
                 }
             }
-            if ($i -eq $this.Mp4InfoList.count){$perr = [Pfm]::errorNotFound}
+            if ($i -eq $this.Mp4InfoList.count){
+                if ($op.NameParts().Length -eq 1){
+                    $perr = [Pfm]::errorNotFound
+                }else{
+                    $perr = [Pfm]::errorParentNotFound
+                }
+            }
 
-    }else{  $perr = [Pfm]::errorParentNotFound }
+            if ($i -ne $this.Mp4InfoList.count -and $op.NameParts().Length -eq 2){
+                for ($i=0; $i -lt $this.Mp4InfoList.count; $i++){
+                    if ($null -ne $this.Mp4InfoList[$i][0].parents){
+                        if($op.NameParts()[1].ToLowerInvariant() -eq $this.Mp4InfoList[$i][0].Mp4Name.ToLowerInvariant()){
+                            break
+                        }
+                    }
+                }
+                if ($i -eq $this.Mp4InfoList.count){
+                    $perr = [Pfm]::errorNotFound
+                }
+            }
+
+            if ($i -ne $this.Mp4InfoList.count){
+                if ($this.openMp4s[$i].openId -eq 0) {$this.openMp4s[$i].openId = $op.NewExistingOpenId() }
+                $existed = $true
+                $endName = $this.Mp4InfoList[$i][0].Mp4Name
+                $openAttribs = $this.openMp4s[$i]
+            }
+
+    }else{ $perr = [Pfm]::errorParentNotFound }
 
     if($perr -eq [Pfm]::errorNotFound -and $op.CreateFileType() -ne 0)
     {	$perr = [Pfm]::errorAccessDenied          }
@@ -2007,11 +2035,33 @@ RarVolume(){
 
 [void] List( [Pfm+MarshallerListOp] $op){
     $perr = 0
-    if ($op.OpenId() -ne $this.openRoot.openId){
-        $perr = [Pfm]::errorAccessDenied
+    if ($op.OpenId() -eq $this.openRoot.openId){
+        for ($i=0; $i -lt $this.Mp4InfoList.count; $i++){
+            if ($null -eq $this.Mp4InfoList[$i][0].parents){
+                $op.Add( $this.openMp4s[$i].attribs, $this.Mp4InfoList[$i][0].Mp4Name)
+            }
+        }
+        
     }else{
-        for ($i=0; $i -lt $this.openMp4s.count;$i++){
-            $op.Add( $this.openMp4s[$i].attribs, $this.Mp4InfoList[$i][0].Mp4Name)
+        for ($i=0; $i -lt $this.openMp4s.count; $i++){
+            if ($op.OpenId() -eq $this.openMp4s[$i].openId -and
+                $this.openMp4s[$i].attribs.fileType -eq [Pfm]::FileTypeFolder){
+                    break
+            }
+        }
+
+        if ($i -eq $this.openMp4s.count){
+            $perr = [Pfm]::errorAccessDenied
+        }else{
+            $parentName = $this.Mp4InfoList[$i][0].Mp4Name
+
+            for ($i=0; $i -lt $this.Mp4InfoList.count; $i++){
+                if ($null -ne $this.Mp4InfoList[$i][0].parents){
+                    if ($this.Mp4InfoList[$i][0].parents -contains $parentName){
+                        $op.Add( $this.openMp4s[$i].attribs, $this.Mp4InfoList[$i][0].Mp4Name)
+                    }
+                }
+            }
         }
     }
 
@@ -2030,7 +2080,7 @@ RarVolume(){
     for ($i=0; $i -lt $this.openMp4s.count;$i++){
         if ($op.OpenId() -eq $this.openMp4s[$i].openId){break}
     }
-
+    
     if ($i -eq $this.openMp4s.count){
         $perr = [Pfm]::errorAccessDenied
     }else{
@@ -2069,7 +2119,15 @@ RarVolume(){
         }else{
             $readSize = $actualSize1
         }
-        
+
+        if ($aMp4Info[$j].srcPath -ne $null){
+            $aMp4Info[$j].fs = New-Object System.IO.FileStream (
+                $aMp4Info[$j].srcPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read
+            )
+        }
+
         if ($aMp4Info[$j].fs -ne $null ){ # fs or cs
             if ($aMp4Info[$j].aes -eq $null){ # fs
                 $aMp4Info[$j].fs.Position = $aMp4Info[$j].FSoffset + $partPos
@@ -2120,6 +2178,11 @@ RarVolume(){
         }
         $partPos = 0
 
+        if ($aMp4Info[$j].srcPath -ne $null){
+            $aMp4Info[$j].fs.close()
+            $aMp4Info[$j].fs = $null
+        }
+
         if ($actualSize1 -gt $partLen ){
             $actualSize1 -= $partLen
             $dataPos += $partLen
@@ -2129,7 +2192,7 @@ RarVolume(){
         }else{
             $actualSize1 = 0
         }
-    }
+    }# end of while
 
 }
 
@@ -2199,25 +2262,16 @@ function startMount($autoOpen, $driveLetter, $MoutName, $Mp4InfoList){
         mountFlags = $mountFlags
         driveLetter = $driveLetter
         mountSourceName = $MoutName  }
-    <#
-    $srtFile = gi 'R:\test\Parasite.2019.BluRay.1080p.srt'
-    $srtFileSize = $srtFile.Length
-    #$srtBuffer = New-Object byte[]  $srtFileSize
-    $srtBuffer = [io.file]::ReadAllBytes($srtFile)
-    #this not work ?
-    #$srtBuffer = gc 'R:\test\Parasite.2019.BluRay.1080p.srt' -enc byte
-    [System.Collections.ArrayList]$srtInfo = @()
-    $srtInfo.add(@{fs = $null; buffer = $srtBuffer ; Mp4offset = 0; length = $srtFileSize
-            Mp4Name = $srtFile.Name; Mp4Size = $srtFileSize
-    })
-    $Mp4InfoList += ,$srtInfo
-    #>
+
     $openMp4s=@()
     for ($i ,$j = 0,3; $i -lt $Mp4InfoList.count;$i++,$j++){
+        $fileType = [Pfm]::fileTypeFile
+        if ($Mp4InfoList[$i][0].isFolder){$fileType = [Pfm]::FileTypeFolder}
+
         $openMp4s += 	new-object Pfm+OpenAttribs -prop @{
                 openSequence = 1 ; accessLevel = [Pfm]::accessLevelReadData;
-                attribs = new-object Pfm+Attribs -prop @{fileType = [Pfm]::fileTypeFile ; 
-                fileId = $j;fileSize=$Mp4InfoList[$i][0].Mp4Size}
+                attribs = new-object Pfm+Attribs -prop @{fileType = $fileType ; 
+                        fileId = $j;fileSize=$Mp4InfoList[$i][0].Mp4Size}
                 }
     }
 
