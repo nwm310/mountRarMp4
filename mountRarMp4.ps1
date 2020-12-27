@@ -1,471 +1,101 @@
-﻿#==================Edit Area================
+﻿param([string]$rarPath = '')
+
+#==================Edit Area================
 $driveLetter = 'Z'
 $MoutName = "thanks for sharing"
-$autoOpen = $true
-$srtIscompressed = $false
-$MakeFolder = $false
-#search other source if some part content missing
-$searchOtherSrc = $false
+$autoOpen = $false
+$dllDir = ''
 
-$dllDir = '.'
-$rarDir = '.'
 #Check PS 5.0
 if ($host.Version.Major -lt 5){Write-Host 'NEED PowerShell 5.0';pause;exit}
-
-if ($MyInvocation.Line -match '^if\(\(Get-ExecutionPolicy'){ cd -literal $PSScriptRoot }
-#====================Functions=====================
-function checkPfm($dllDir){
-    pushd -literal $dllDir
+#=============Functions、Classes =====================
+function checkPfm(){
+    if ($script:dllDir -ne ''){
+        pushd -literal $script:dllDir
+    }else{
+        pushd '.'
+    }
+    
     $dllFles = @(gi pfmclr_[0-9][0-9][0-9].dll , pfmshim16_[0-9][0-9][0-9].dll )
 
     if ($dllFles.count -ne 2){
-        popd
-        pushd -literal $script:rarDir
-        $dllFles = @(gi pfmclr_[0-9][0-9][0-9].dll , pfmshim16_[0-9][0-9][0-9].dll )
-    }
-
-    if ($dllFles.count -ne 2){
-        Write-Host 'Need  DLLs or too many DLLs'; pause; exit
+        Write-Host 'Need DLLs or too many DLLs'; pause; popd; exit
     }else{
-        Add-Type  -Path  $dllFles[0]
+        Add-Type -Path $dllFles[0]
     }
 
     if ( ! ('pfm' -as [type])){
-        Write-Host 'Dlls are not loaded'; pause; exit
+        Write-Host 'Dlls are not loaded'; pause; popd; exit
     }
 
     $pfmApi = $null
+    $err = [Pfm]::ApiFactory([ref]$pfmApi)
+    if($err -ne 0){Write-Host '"Pismo File Mount Audit Package" was not installed'; pause; popd; exit}
+
+    popd
+}
+
+function startMount($rarPath, $autoOpen, $driveLetter, $MoutName){
+    #ReadOnly (0x00000001)  UnmountOnRelease (0x00020000)
+    #WorldWrite (0x00000008)
+    $mountFlags = 0x20001
+    if ($autoOpen){$mountFlags = 0x20001 -bor 0x10000}
+    $mcp = new-object Pfm+MountCreateParams -prop @{
+        mountFlags = $mountFlags
+        driveLetter = $driveLetter
+        mountSourceName = $MoutName  }
+
+    $msp = new-object Pfm+MarshallerServeParams  -prop @{
+        volumeFlags = 1
+        dispatch = [RarVolume]::new($rarPath)
+        formatterName = "RarMp4Fs"  }
+
+
+    $n1 = $n2 = -1
+    $err = [Pfm]::SystemCreatePipe( [ref] $n1, [ref]$n2 )
+    $msp.toFormatterRead = $n1
+    $mcp.toFormatterWrite = $n2
+        
+
+    $n1 = $n2 = -1
+    $err = [Pfm]::SystemCreatePipe( [ref] $n1, [ref]$n2 )
+    $mcp.fromFormatterRead = $n1
+    $msp.fromFormatterWrite = $n2        
+
+
+
+    $pfmApi = $null 
     $err = [Pfm]::ApiFactory( [ref] $pfmApi)
-    if($err -ne 0){Write-Host '"Pismo File Mount Audit Package" was not installed'; pause; exit}
-    popd
-}
-function findRar($rarPath){
-    $rarName = $null
+    if($err -ne 0){  Write-Host "ERROR: $err Unable to open PFM API.`n" ; pause ; exit }
 
-    if ($rarPath -ne $null) {
-        if (Test-Path -literal $rarPath -PathType Leaf){
-            $rarDir = Split-Path $rarPath
-            $rarName = Split-Path $rarPath -Leaf
-        }elseif(Test-Path -literal $rarPath -PathType Container){
-            $rarDir = $rarPath
-        }else{
-            Write-Host "$rarPath  is not exist"
-            $rarDir = '.'
-        }
-    }
-    $script:rarDir = $rarDir
-    pushd -literal $rarDir
-    
-    $RarGroup = dir *.rar | sort | ?{$_.name -match '(.*?)(\.part\d+)?\.rar$' } |
-            group -prop {$matches[1] + '/' + $matches[2].length}
-    
-    $rarFiles = $null
-    [System.Collections.ArrayList]$otherGroup = @()
-    
-    for ($i = 0; $i -lt $RarGroup.count; $i++){
-        if ($RarGroup[$i].Group.name -contains $rarName){
-            $rarFiles = $RarGroup[$i].group
-        }else{
-            [void]$otherGroup.add($RarGroup[$i].group)
-        }
-    }
+    $mount = $null
+    $err = $pfmApi.MountCreate( $mcp, [ref] $mount)
+    if ($err -ne 0){ Write-Host "ERROR: $err Unable to create mount.`n"  }
 
-    if ($null -eq $rarFiles -and $otherGroup.count -ne 0){
-        $rarFiles = $otherGroup[0]
-        $otherGroup.RemoveAt(0)
-    }
-    popd
+    [Pfm]::SystemCloseFd( $mcp.toFormatterWrite)
+    [Pfm]::SystemCloseFd( $mcp.fromFormatterRead)
 
-    return $rarFiles, $otherGroup
-}
-function getVint([ref]$bPos){
-    $bPosOld = $bPos.Value
-    
-    while ($buffer[$bPos.Value++] -band 0x80) {}
+    $marshaller = $null
+    $err = [Pfm]::MarshallerFactory( [ref]$marshaller )
+    if($err -ne 0){  Write-Host "ERROR: $err Unable to create marshaller.`n" ; pause ; exit }
 
-    if ( ($bPos.Value - $bPosOld) -gt 9 ){throw 'Vint : too many bytes'}  # 7 * 9 = 63
+    $marshaller.ServeDispatch( $msp)
 
-    $data = $n = 0
+    [Pfm]::SystemCloseFd( $msp.toFormatterRead)
+    [Pfm]::SystemCloseFd( $msp.fromFormatterWrite)
 
-    while ($bPosOld -lt $bPos.Value){
-        [uint64]$d = $buffer[$bPosOld++] -band 0x7F
-        $data +=  $d -shl  (7 * $n++)
-    }
-    return $data
+    $pfmApi.Dispose()
+    $mount.Dispose()
+    $marshaller.Dispose()
 }
 
-function RarName4($buffer, $namePos, $nameSize){
-    $nameEnd = $namePos + $nameSize
-
-    #search zero between usual and encoded Unicode name
-    for ($i = $namePos ; $i -lt $nameEnd ; $i++){
-        if ($buffer[$i] -eq 0) {break}
-    }
-
-    #only ansi name
-    if ($i -eq $nameEnd){
-        return [System.Text.Encoding]::ASCII.GetString($buffer,$namePos,$nameSize)
-    }
-
-    #===============get unicode name===============
-    $nameAnsiEnd = $i
-    $i++
-    $j = $namePos
-
-    #HighByte of two bytes of Unicode
-    $HighByte = $buffer[$i++]
-    [byte]$FlagBits = [byte]$Flags = 0
-    $Mp4FullName = $null
-
-    :out
-    While ($i -lt $nameEnd){
-        #after 4 times , $FlagBit become to 0 , read a byte into $Flags
-        #There are 4 flags(per flag 2bit)  in  $Flags
-        if ($FlagBits -eq 0){
-            $Flags = $buffer[$i++]
-            $FlagBits = 8
-        }
-
-        switch ($Flags -shr 6){
-            0{#ascii stored in encoded area
-                if ($i -ge $nameEnd){break out}
-                $Mp4FullName += [System.Text.Encoding]::ASCII.GetString($buffer[$i++])
-                $j++
-            }
-
-            1{# one byte of unicode in encoded area
-                if ($i -ge $nameEnd){break out}
-                $Mp4FullName += [System.Text.Encoding]::Unicode.GetString(@($buffer[$i++],$HighByte))
-                $j++
-            }
-
-            2{# two bytes of unicode in encoded area
-                if ($i+1 -ge $nameEnd){break out}
-                $Mp4FullName += [System.Text.Encoding]::Unicode.GetString(@($buffer[$i],$buffer[$i+1]))
-                $i += 2
-                $j++
-            }
-
-            3{#ascii stored in ansi area
-                if ($i -ge $nameEnd){break out}
-                
-                #length of ascii to be read
-                $L = $buffer[$i++]
-                if ( ($L -band 0x80) -ne 0){
-                    if ($i -ge $nameEnd){break out}
-                    $Correction = $buffer[$i++]
-
-                    for ($L = ($L -band 0x7F)+2 ;$L -gt 0 -and $j -lt $nameAnsiEnd ; $L-- ,$j++){
-                        $Mp4FullName += [System.Text.Encoding]::Unicode.GetString(
-                            @( (($buffer[$j] + $Correction) -band 0xFF) , $HighByte )
-                        )
-                    }
-                }else{
-                    for ($L += 2 ;$L -gt 0 -and $j -lt $nameAnsiEnd ; $L-- ,$j++){
-                        $Mp4FullName += [System.Text.Encoding]::ASCII.GetString($buffer[$j])
-                    }
-                }
-            }
-        }#end of switch
-        $Flags = $Flags -shl 2
-        $FlagBits -=2
-
-    }#end of while
-
-    return $Mp4FullName
-}
-
-
-$getHeader4 = {
-    param($fs, $buffer, $fs0 = $null)
-
-    $HeadEncrypt = $HeadTypeName = $rar5E = $salt = $PackType = $PackOffset =
-    $PackSize = $Mp4FullName = $Mp4Size = $FileEncrypt = $Compression = $isDir = $false
-
-    $n = $fs.read($buffer, 0, 7)
-    if ( $n -lt 7 ) {throw 'file size is too small'}
-    
-    $HeadType = $buffer[2]
-    $HeadFlag = [BitConverter]::ToUInt16($buffer ,3)
-    $HeadSize = [BitConverter]::ToUInt16($buffer ,5)
-
-    $n = $HeadSize - 7
-    $n1 = $fs.read($buffer, 7, $n)
-
-    if ($n1 -lt $n) {throw 'file size is too small'}
-
-    #rar header is encrypted
-    if ($fs0 -ne $null){
-        $PackOffset = $fs0.position
-    }else{
-        $PackOffset = $fs.position
-    }
-    #=============after reading  header into buffer===============
-    switch ($HeadType){
-        0x73{
-            $HeadTypeName = 'Main'
-            if ($HeadFlag -band 0x80){
-                $HeadEncrypt = $true
-
-                #read salt after this header
-                $salt = new-object byte[] 8
-                $n = $fs.read($salt, 0, 8)
-                if ($n -lt 8) {throw 'file size too small'}
-                $fs.position -= 8
-            }
-        }
-
-        0x74{
-            $HeadTypeName = 'File'
-            
-            $PackSize = [BitConverter]::ToUInt32($buffer, 7)
-            $Mp4Size  = [BitConverter]::ToUInt32($buffer, 11)
-
-            #if file size too big 
-            if ($HeadFlag -band 0x100){
-                $HighSize = [BitConverter]::ToUInt32($buffer, 32)
-                $PackSize += ([uint64]$HighSize -shl 32)
-
-                $HighSize = [BitConverter]::ToUInt32($buffer, 36)
-                $Mp4Size += ([uint64]$HighSize -shl 32)
-
-                $namePos = 40
-            }else{
-                $namePos = 32
-            }
-
-            #get file name
-            $nameSize = [BitConverter]::ToUInt16($buffer, 26)
-            $Mp4FullName = RarName4  $buffer  $namePos  $nameSize
-            
-
-            #normal pack ? first pack  ?  middle pack ? last pack ?
-            $PackType = $HeadFlag -band 3
-
-            if ($HeadFlag -band 4){
-                $FileEncrypt = $true
-                $saltPos = $namePos + $nameSize
-                $salt = new-object byte[] 8
-                [array]::copy($buffer, $saltPos, $salt, 0, 8)
-            }
-
-            if (($HeadFlag -band 0xE0) -eq 0xE0){
-                $isDir = $true
-            }else{
-                $isDir = $false
-            }
-
-            if ($buffer[25] -ne 0x30) {$Compression = $true}
-        }#end of 0x74
-
-        default{            
-            #other block
-            if ($HeadFlag -band 0x8000){ 
-                $PackSize = [BitConverter]::ToUInt32($buffer, 7)
-            }
-        }#end of default
-    }#end of switch
-
-    return $HeadEncrypt, $HeadTypeName, $rar5E, $salt, $PackType, $PackOffset,
-    $PackSize, $Mp4FullName, $Mp4Size, $FileEncrypt, $Compression, $isDir
-}
-
-$getHeader5 = {
-    param($fs, $buffer, $fs0 = $null)
-
-    $HeadEncrypt = $HeadTypeName = $rar5E = $salt = $PackType = $PackOffset =
-    $PackSize = $Mp4FullName = $Mp4Size = $FileEncrypt = $Compression = $isDir = $false
-
-    #Read CRC
-    $n = $fs.read($buffer, 0, 4)
-    if ($n -lt 4) {throw 'file size too small'}
-
-    #Read HeadSize
-    $n = $fs.read($buffer, 0, 3)
-    if ($n -lt 3) {throw 'file size too small'}
-
-    $bPos = 0
-    $HeadSize = getVint ([ref]$bPos)
-    $n1 = $n - $bPos
-    #[array]::Copy($buffer, $bPos, $buffer, 0, $n1)
-    for ($i = 0; $i -lt $n1; $i++){
-        $buffer[$i] = $buffer[$bPos+$i]
-    }
-    #Read Header into buffer
-    $n = $fs.read($buffer, $n1, $HeadSize - $n1)
-    if ($n -lt $HeadSize - $n1) {throw 'file size too small'}
-    $bPos = 0
-
-    #rar header is encrypted
-    if ($fs0 -ne $null){
-        $PackOffset = $fs0.position
-    }else{
-        $PackOffset = $fs.position
-    }
-
-    #=============after reading  header into buffer===============
-    #Read HeadType  HeadFlag
-    $HeadType = getVint ([ref]$bPos)
-
-    $HeadFlag = getVint ([ref]$bPos)
-
-    switch -w ($HeadType){
-        #assume that data area is not exist in main block
-        1{$HeadTypeName = 'Main'}
-
-        [23]{# File header or Service header
-            #Extra area size
-            if ($HeadFlag -band 1) {
-                getVint ([ref]$bPos) > $null 
-            }
-
-            #Data area size
-            $PackSize = 0
-            if ($HeadFlag -band 2) {
-                $PackSize = getVint ([ref]$bPos)
-            }
-
-            if ($_ -eq 2) {
-                $HeadTypeName = 'File'
-            }else{#service header
-                $HeadTypeName = 'Service'
-            }
-
-            #File flags
-            $FileFlags = getVint ([ref]$bPos)
-            if ($FileFlags -band 1){
-                $isDir = $true
-            }else{
-                $isDir = $false
-            }
-
-            #Unpacked size
-            $Mp4Size = getVint ([ref]$bPos)
-
-            #Attributes
-            getVint ([ref]$bPos) > $null
-
-            #mtime
-            if ($FileFlags -band 2) {$bPos +=4}
-
-            #Data CRC32
-            if ($FileFlags -band 4) {$bPos +=4}
-
-            #Compression information
-            if (  (getVint ([ref]$bPos)) -band 0x0380) {$Compression = $true}
-
-            #Host OS
-            getVint ([ref]$bPos) > $null
-
-
-            #file name length
-            $nameSize = getVint ([ref]$bPos)
-
-            #get file name
-            $Mp4FullName=[System.Text.Encoding]::UTF8.GetString($buffer,$bPos,$nameSize)
-            $bPos += $nameSize
-
-            #normal pack ? first pack  ?  middle pack ? last pack ?
-            $PackType = ($HeadFlag -shr 3) -band 3
-
-            #encrypt ?  read extra area
-            while ($bPos -lt $HeadSize){
-                $recordSize = getVint ([ref]$bPos)
-                $recordEnd = $bPos + $recordSize
-
-                if ($recordEnd -gt $HeadSize){break}
-                                
-                #record type
-                $recordType = getVint ([ref]$bPos)
-                if ($recordType -eq 1){#File encryption record
-                    $FileEncrypt = $true
-                    $rar5E = @{}
-                    
-                    #Encryption version
-                    getVint ([ref]$bPos) > $null
-
-                    #Encryption flags
-                    $eFlag = getVint ([ref]$bPos)
-
-                    #KDF count
-                    $rar5E.KDFcount = $buffer[$bPos++]
-
-                    #salt
-                    $salt = new-object byte[] 16
-                    [array]::Copy($buffer, $bPos, $salt, 0, 16)
-                    $bPos += 16
-                    
-                    #iv
-                    $rar5E.iv = new-object byte[] 16
-                    [array]::Copy($buffer, $bPos, $rar5E.iv, 0, 16)
-                    $bPos += 16
-
-                    #Check value
-                    if ($eFlag -band 1){
-                        $rar5E.checkValue = new-object byte[] 12
-                        [array]::Copy($buffer, $bPos, $rar5E.checkValue, 0, 12)
-                        $bPos += 12
-                    }
-
-                }elseif($recordType -eq 5){#File system redirection record
-                    $redirection = getVint ([ref]$bPos)
-                    $flag1 = getVint ([ref]$bPos)
-                    if ($redirection -like '[245]' -and $flag1 -eq 0){
-                        $HeadTypeName = 'FileCopy'
-                        
-                        $nameSize= getVint ([ref]$bPos)
-                        $rar5E = @{}
-                        $rar5E.targetName = [System.Text.Encoding]::UTF8.GetString(
-                            $buffer, $bPos, $nameSize
-                            )
-                    }else{
-                        $HeadTypeName = 'FileOtherLink'
-                    }
-                    
-                }
-                $bPos = $recordEnd
-            }#end of while
-        }#end of [23]
-
-        4{# Archive encryption header
-            $HeadTypeName = 'Encryption'
-            $HeadEncrypt = $true
-            $rar5E = @{}
-
-            #Encryption version
-            getVint ([ref]$bPos) > $null
-
-            #Encryption flags
-            $eFlag = getVint ([ref]$bPos)
-
-            #KDF count
-            $rar5E.KDFcount = $buffer[$bPos++]
-
-            #salt
-            $salt = new-object byte[] 16
-            [array]::Copy($buffer, $bPos, $salt, 0, 16)
-            $bPos += 16
-
-            #Check value
-            if ($eFlag -band 1){
-                $rar5E.checkValue = new-object byte[] 12
-                [array]::Copy($buffer, $bPos, $rar5E.checkValue, 0, 12)
-                $bPos += 12
-            }
-
-        }
-        5{# End of archive header
-        }
-        default{
-            write-host "unknown header type : $HeadType"
-        }
-    }# end of switch
-
-    return $HeadEncrypt, $HeadTypeName, $rar5E, $salt, $PackType, $PackOffset,
-    $PackSize, $Mp4FullName, $Mp4Size, $FileEncrypt, $Compression, $isDir
-}
-
-$SHA1SPdef =  @'
+class RAR {
+    [byte]$Ver = 4
+    [bool]$IsMultiVolume = $false
+
+    [bool]$IsHeadEncrypt = $false
+    [System.Security.Cryptography.AesCryptoServiceProvider]$AesForAll = $null
+    static [string]$SHA1SPdef =  @'
 // modify version of  SHA1CryptoServiceProvider.cs 
 // for calculation of  rar3 key iv
 //
@@ -804,554 +434,1071 @@ namespace SHA1SP {
 	}
 }
 '@
+    [hashtable]$AesTable = @{}
+    [string]$password = ''
 
-function getAESKeyIV ($h, $salt, $rar5E = $null){
-    #rar 5 : return iv  is $null
+    [rarEntry[]]$Entries = @()
+    [hashtable]$FsTable = @{}
 
-    if ($null -ne $script:keyIV_Table."$salt"){
-        return $script:keyIV_Table."$salt"
-    }
+    #=============================
+    RAR([string]$rarPath){
+        $file = gi -literal $rarPath 2>$null
+        if ($file -eq $null){throw "$rarPath is not exist"}
+        if ($file.PSIsContainer){throw "$rarPath is not a file"}
+        if ($file.Extension -ne '.rar'){throw "$rarPath is not a rar file"}
 
-    if ($script:lastPassword -eq $null){
-        $password = read-host 'password ?'
-        $script:lastPassword = $password
-    }else{
-        $password = $script:lastPassword
-    }
+        $files = @()
+        if ($file.name -match '(?<name>.*)\.part(?<num>\d+)\.rar'){ # multiVolumes
+            $this.IsMultiVolume = $true
+            $name = $matches.name
+            $Len = $matches.num.length
 
-    <#
-    if($h.rarVer -eq 5 -and $h.comment.length -gt 0){
-        $comments = $h.comment -split "`n"
-        if ($comments.count -eq 1){
-            $password = $comments[0]
-        }else{
-            Write-Host $h.comment
-            $password = read-host 'password ?'
+            $files += dir -literal $file.directory -filter "$name*.part*.rar" -file |?{
+                $_.name -match "\d{$Len}\.rar$"
+            } | sort
+
+        }else{ # single file
+            $files += $file
         }
-    }
-    #>
 
-    #https://github.com/lclevy/unarcrypto
-    #https://stackoverflow.com/questions/18648084/rfc2898-pbkdf2-with-sha256-as-digest-in-c-sharp
+        trap {$fs.close()}
+        $buffer = new-object byte[](20KB)
+        
+        foreach ($file in $files) {
+            $fs = $file.OpenRead()
+            $this.FsTable[$file] = $fs
+            $this.beforeFileHeader($fs, $buffer)
+            $this.parseFileHeader($fs, $buffer, $file)
+        }        
+        $buffer = $null
 
-    if ($h.rarVer -eq 4){
-        $seed = [System.Text.Encoding]::Unicode.GetBytes($password) + $salt
-        $seedNew = New-Object byte[] $seed.length
-        [array]::Copy($seed, 0, $seedNew, 0, $seed.length)
+    }#end of Ctor
+
+    [void]beforeFileHeader([IO.FileStream]$fs, [byte[]]$buffer){
+
+        $n = $fs.read($buffer , 0 , 8)
+        if ($n -lt 8) {throw "$($fs.Name) : file size is too small"}
     
-        $iv = @()
-        if ( ! ('SHA1SP.SHA1SP' -as [type])){Add-Type -TypeDef $script:SHA1SPdef }
-        $sha1 = new-object SHA1SP.SHA1SP
-    
-        for($i = 0; $i -lt 16; $i++){
-            for($j = 0; $j -lt 0x4000; $j++){
-                $count = [System.BitConverter]::GetBytes($i*0x4000 + $j)
-                $sha1.HashCore($seedNew, 0, $seedNew.length) > $null
-                #$sha1.HashCore($seed, 0, $seed.length) > $null
-                $sha1.HashCore($count, 0, 3) >$null
-                if ($j -eq 0){
-                    $hash = $sha1.HashForIV()
-                    $iv += $hash[19]
-                }
-            }
-        }
-        $hash = $sha1.HashFinal()
-        $key = $hash[3..0] + $hash[7..4] + $hash[11..8] + $hash[15..12]
-
-    }else{# rar 5
-
-        while ($true){
-            $h256 =  new-object System.Security.Cryptography.HMACSHA256
-            $h256.Key = [System.Text.Encoding]::UTF8.GetBytes($password)
-    
-            $u = $h256.ComputeHash($salt + (0,0,0,1))
+        if ([BitConverter]::ToString($buffer,0,7) -eq '52-61-72-21-1A-07-00'){
+            $this.Ver = 4
+            $fs.Position = 7
+            $result = $this.getHeader4($fs, $buffer, $null)
             
-            $key = $u
-          
-            $count = 1 -shl $rar5E.KDFcount
-            for ($i = 1; $i -lt $count; $i++){
-                $u = $h256.ComputeHash($u)
-                for ($j = 0; $j -lt $key.count; $j++){
-                    $key[$j] = $key[$j] -bxor $u[$j]
-                }
-            }
-    
-            $v2 = New-Object byte[] 32
-            [array]::Copy($key, 0, $v2, 0, 32)
-            for ($i = 0 ; $i -lt 32; $i++){
-                $u = $h256.ComputeHash($u)
-                for ($j = 0; $j -lt $v2.count; $j++){
-                    $v2[$j] = $v2[$j] -bxor $u[$j]
-                }
-            }
-    
-            if ($null -eq $rar5E.checkValue){ # have no checkValue
-                break
-
-            }else{# have checkValue
-                $check8 = new-object byte[] 8
-    
-                for ($i = 0; $i -lt 32; $i++){
-                    $check8[$i % 8] = $check8[$i % 8] -bxor $v2[$i]
-                }
-    
-                if ("$check8" -eq $rar5E.checkValue[0..7]){#pass ok
-                    break
-                    
-                }else{#pass error
-                    Write-Host 'password error'
-                    $script:lastPassword = $null
-                    
-                    $password = read-host 'password ?'
-                    $script:lastPassword = $password
-                }
-            }
-
-        }# end of while
-
-        $iv = $null
-        
-    }#end of else
-    
-    $script:keyIV_Table."$salt" = $key, $iv
-
-    return $key,$iv
-}
-
-function adjustRange($Mp4Info){
-    if ($Mp4Info[0].fs -eq $null -and  $null -eq $Mp4Info[0].buffer ){return}
-    if ($Mp4Info.count -lt 2){return}
-
-    ($Mp4Info.Count - 1) .. 1 | %{
-        $current = $Mp4Info[$_]
-        $prev = $Mp4Info[$_ - 1]
-        $n = $current.Mp4offset % 16
-
-        if ($current.fs -eq $null){
-            if ($prev.fs -ne $null -and $n){
-                $current.Mp4offset -= $n
-                $current.length += $n
-                $prev.length -= $n
-            }
-
-        }else{ # $current.fs -ne $null
-            if ($prev.fs -ne $null){
-                if ($n){
-                    $blockIV = New-Object byte[] 16
-                    $blockEncrypted = New-Object byte[] 16
-                    $blockOut = New-Object byte[] 16
-
-                    # $pre.length should greater than 31 .   no check here
-                    $prev.fs.position = $prev.FSoffset + $prev.Length - ($n + 16)
-                    [void]$prev.fs.read($blockIV, 0, 16)
-                    [void]$prev.fs.read($blockEncrypted, 0, $n)
-                    
-                    $current.fs.position = $current.FSoffset
-                    [void]$current.fs.read($blockEncrypted, $n, 16 - $n)
-
-                    $current.aes.IV = $blockIV
-
-                    [void]$current.aes.CreateDecryptor().TransformBlock($blockEncrypted, 0, 16, $blockOut, 0)
-
-                    $current.aes.IV = $blockEncrypted
-                    $current.Mp4offset += 16 - $n
-                    $current.FSoffset += 16 - $n
-                    $current.length -= 16 - $n
-
-                    $prev.length -= $n
-                    
-                    $Mp4Info.insert($_ , @{fs = $null; buffer = $blockOut ;
-                        length = 16 ; Mp4offset = $current.Mp4offset - 16
-                    })
-
-                }else{ # $n -eq 0
-                    $blockIV = New-Object byte[] 16
-                    $prev.fs.position = $prev.FSoffset + $prev.Length - 16
-                    [void]$prev.fs.read($blockIV, 0, 16)
-
-                    $current.aes.IV = $blockIV
-                }
-            }else{# $prev.fs -eq $null
-                $blockIV = New-Object byte[] 16
-                if ($n){
-                    $current.fs.position = $current.FSoffset + (16 - $n)
-                    [void]$current.fs.read($blockIV, 0, 16)
-
-                    $current.Mp4offset += 32 - $n
-                    $current.FSoffset += 32 - $n
-                    $current.length -= 32 - $n
-
-                    $prev.length += 32 - $n
-                }else{# $n -eq 0
-                    $current.fs.position = $current.FSoffset
-                    [void]$current.fs.read($blockIV, 0, 16)
-
-                    $current.Mp4offset += 16
-                    $current.FSoffset += 16
-                    $current.length -= 16
-
-                    $prev.length += 16
-                }
-
-                $current.aes.IV = $blockIV  
-            }# end of $prev -eq $null
-        }# end of $current -eq $null
-    }# end of foreach
-}
-
-function beforeFileHeader($getHeader, $h, $fs, $buffer, $file){
-    $result = & $getHeader $fs  $buffer
-    #$HeadEncrypt, $HeadTypeName, $rar5E, $salt, $PackType, $PackOffset,
-    #$PackSize, $Mp4FullName, $Mp4Size, $FileEncrypt, $Compression
-
-    $HeadEncrypt, $HeadTypeName, $rar5E, $salt = $result[0..3]
-
-    $h.HeadEncrypt = $HeadEncrypt
-
-    #rar v4
-    if ($h.rarVer -eq 4 -and $HeadTypeName -ne 'Main') {throw "$file : Main header error"}
-
-    if ($h.rarVer -eq 5){
-        if ($HeadTypeName -eq 'Main'){
-            return
-        }elseif($HeadTypeName -ne 'Encryption'){
-            throw "$file : Main header error"
-        }
-    }
-
-    if ($HeadEncrypt){
-        $key , $iv = getAESKeyIV $h $salt $rar5E
-        if ($h.rarVer -eq 5){
-            $iv = new-object byte[] 16
-            $n = $fs.read($iv, 0, 16)
-            if ($n -lt 16) {throw 'file size too small'}
-        }
-
-        $h.aes_obj = new-object System.Security.Cryptography.AesCryptoServiceProvider
-        $h.aes_obj.Key = $key
-        $h.aes_obj.IV = $iv
-
-        # Padding  none
-        $h.aes_obj.Padding = 1
-
-        if ($h.rarVer -eq 5){
-
-            $cs = new-object System.Security.Cryptography.CryptoStream (
-                $fs, $h.aes_obj.CreateDecryptor(), 0
-            )
+            if ($result.HeadTypeName -ne 'Main') {throw "$($fs.Name) : Main header error"}
             
-            $result = & $getHeader $cs  $buffer  $fs
-
-            if ($result[1] -ne 'Main'){;throw "$file : Main header error"}
-
-            $cs = $null
-        }
-    }
-
-}
-
-function parseFileHeader($getHeader, $h, $fs, $buffer, $file){
+            if ($result.IsEncrypt){
+                $this.IsHeadEncrypt = $result.IsEncrypt
+                $this.AesForAll = $this.getAes($this.Ver, $this.password, $result.Salt, $null, $null)
+            }
     
-    if ($h.HeadEncrypt){
-        if ($h.rarVer -eq 4){
-            # all salts are the same
-            $fs.position += 8
-        }elseif($h.rarVer -eq 5){
-            $iv = new-object byte[] 16
-            $n = $fs.read($iv, 0, 16)
-            if ($n -lt 16) {throw 'file size too small'}
+        }elseif ([BitConverter]::ToString($buffer,0,8) -eq '52-61-72-21-1A-07-01-00'){
+            $this.Ver = 5
+            $result = $this.getHeader5($fs, $buffer, $null)
 
-            $h.aes_obj.iv = $iv
-        }
-        
-        $cs = new-object System.Security.Cryptography.CryptoStream (
-            $fs, $h.aes_obj.CreateDecryptor(), 0
-        )
-        
-        $result = & $getHeader $cs  $buffer  $fs
-        $cs = $null
-    }else{
-        $result = & $getHeader $fs  $buffer
+            if ($result.HeadTypeName -ne 'Main' -and $result.HeadTypeName -ne 'Encryption'){
+                throw "$($fs.Name) : Main header error"
+            }
+
+            if ($result.IsEncrypt){
+                $this.IsHeadEncrypt = $result.IsEncrypt
+                $this.AesForAll = $this.getAes($this.Ver, $this.password, $result.Salt, $result.KDFcount, $result.checkValue)
+                
+                [byte[]]$iv = new-object byte[] 16
+                $n = $fs.read($iv, 0, 16)
+                if ($n -lt 16) {throw "$($fs.Name) : file size is too small"}
+                $this.AesForAll.IV = $iv
+
+                $cs = new-object System.Security.Cryptography.CryptoStream (
+                    $fs, $this.AesForAll.CreateDecryptor(), 0
+                )
+
+                $result = $this.getHeader5($cs, $buffer, $fs)
+    
+                if ($result.HeadTypeName -ne 'Main'){;throw "$($fs.Name) : Main header error"}
+                $cs = $null
+
+            }# end of if ($result.IsEncrypt)
+
+        }else{throw "$($fs.Name) is not RAR"}
     }
 
-    $HeadTypeName, $rar5E, $salt, $PackType, $PackOffset, $PackSize,
-    $Mp4FullName, $Mp4Size, $FileEncrypt, $Compression, $isDir = $result[1..11]
+    [void]parseFileHeader([IO.FileStream]$fs, [byte[]]$buffer, [IO.FileInfo]$fileInfo){
 
-    if ($HeadTypeName -ne 'File') {
-        if ($HeadTypeName -eq 'Service' -and $Mp4FullName -ceq 'CMT'){
+        while ($fs.Position -lt $fs.length){
 
-            $fs.position = $PackOffset
-            if ($buffer.length -lt $PackSize){
-                write-host 'comment size is too large'
-            }else{
-                $n = $fs.read($buffer, 0, $PackSize)
-                if ($n -lt $PackSize){
-                    write-host 'file is too small to read comment'
+            # read header
+            if ($this.Ver -eq 4){
+                if ($this.IsHeadEncrypt){
+                    # salt already read
+                    # all salts are the same.  skip it
+                    $fs.position += 8
+    
+                    $cs = new-object System.Security.Cryptography.CryptoStream (
+                        $fs, $this.AesForAll.CreateDecryptor(), 0
+                    )
+    
+                    $result = $this.getHeader4($cs, $buffer, $fs)
+                    $cs = $null
+                
                 }else{
-                    if ($null -ne $h.aes_obj){#encrypted header
-                        $h.aes_obj.iv = $rar5E.iv
-                        $d1 = $h.aes_obj.CreateDecryptor()
-                        [void]$d1.TransformBlock($buffer, 0, $PackSize, $buffer, 0)
-                        $d1.Dispose()
+                    $result = $this.getHeader4($fs, $buffer, $null)
+                }
+    
+            }elseif ($this.Ver -eq 5){
+                if ($this.IsHeadEncrypt){
+                    $iv = new-object byte[] 16
+                    $n = $fs.read($iv, 0, 16)
+                    if ($n -lt 16) {throw "$($fs.Name) : file size is too small"}
+            
+                    $this.AesForAll.IV = $iv
+            
+                    $cs = new-object System.Security.Cryptography.CryptoStream (
+                        $fs, $this.AesForAll.CreateDecryptor(), 0
+                    )
+            
+                    $result = $this.getHeader5($cs, $buffer, $fs)
+                    $cs = $null
+                }else{
+                    $result = $this.getHeader5($fs, $buffer, $null)
+                }
+            
+            }else{throw 'RAR version error'}
+
+            if ($result.HeadTypeName -eq 'File'){
+                [rarEntry]$entry = [rarEntry]::new($result)
+                $entry.rarFileInfo = $fileInfo
+
+                if ($result.PackOffset + $result.PackSize -gt $fs.length) {
+                    $entry.ActualPackSize = $fs.length - $result.PackOffset
+                }else{
+                    $entry.ActualPackSize = $result.PackSize
+                }
+                
+                if ($this.IsHeadEncrypt){
+                    $entry.Aes = $this.AesForAll
+                }elseif ($result.IsEncrypt){
+                    $entry.Aes = $this.getAes($this.Ver, $this.password, $result.Salt, $result.KDFcount, $result.checkValue)
+                }
+    
+                if ($null -ne $entry.Aes){
+                    if ($this.Ver -eq 4){
+                        $entry.iv0 = $entry.Aes.IV
+                    }else{# Ver 5
+                        $entry.iv0 = $result.iv
+                    }
+                }
+                
+                $this.Entries += $entry
+            }
+
+            #Is this block  the last block need to be processed  ? 
+            $PackEnd = $result.PackOffset + $result.PackSize
+            switch -w  ($result.PackType) {
+                #First pack  or Middle pack
+                #no block after this block  need to be processed
+                [23]{return}
+    
+                [01]{ # normal pack  or last pack
+                    
+                    if ($PackEnd -gt $fs.length) {
+                        return
+                    }else{
+                        $fs.Position = $PackEnd
+                    }
+                }
+                default{$fs.Position = $PackEnd}
+            }
+        }    
+    }
+
+    [PSCustomObject]getHeader4($fs, [byte[]]$buffer, [IO.FileStream]$fs0){
+        
+        $HeadTypeName = $IsEncrypt = $Salt = 
+        $PackType = $PackOffset = $PackSize =
+        $FullName = $FileSize = $IsCompress = $IsDir =
+        $KDFcount = $iv = $checkValue = $FileLinkType = $targetName = $false
+
+        $n = $fs.read($buffer, 0, 7)
+        if ($n -lt 7) {throw "$($fs.Name) : file size is too small"}
+        
+        $HeadType = $buffer[2]
+        $HeadFlag = [BitConverter]::ToUInt16($buffer ,3)
+        $HeadSize = [BitConverter]::ToUInt16($buffer ,5)
+    
+        $n = $HeadSize - 7
+        $n1 = $fs.read($buffer, 7, $n)
+    
+        if ($n1 -lt $n) {throw "$($fs.Name) : file size is too small"}
+    
+        #=============after reading  header into buffer===============
+        if ($fs0 -ne $null){ # rar header is encrypted
+            $PackOffset = $fs0.position
+        }else{
+            $PackOffset = $fs.position
+        }
+        
+        switch ($HeadType){
+            0x73{
+                $HeadTypeName = 'Main'
+                if ($HeadFlag -band 0x80){
+                    $IsEncrypt = $true
+    
+                    #read salt after this header
+                    $Salt = new-object byte[] 8
+                    $n = $fs.read($Salt, 0, 8)
+                    if ($n -lt 8) {throw "$($fs.Name) : file size is too small"}
+                    # there is a 8 byte salt before every file header
+                    $fs.position -= 8
+                }
+            }
+    
+            0x74{
+                $HeadTypeName = 'File'
+                
+                $PackSize = [BitConverter]::ToUInt32($buffer, 7)
+                $FileSize  = [BitConverter]::ToUInt32($buffer, 11)
+    
+                #if file size too big 
+                if ($HeadFlag -band 0x100){
+                    $HighSize = [BitConverter]::ToUInt32($buffer, 32)
+                    $PackSize += ([uint64]$HighSize -shl 32)
+    
+                    $HighSize = [BitConverter]::ToUInt32($buffer, 36)
+                    $FileSize += ([uint64]$HighSize -shl 32)
+    
+                    $namePos = 40
+                }else{
+                    $namePos = 32
+                }
+    
+                #get file name
+                $nameSize = [BitConverter]::ToUInt16($buffer, 26)
+                $FullName = $this.RarName4($buffer,  $namePos,  $nameSize)
+                
+    
+                #normal pack ? first pack  ?  middle pack ? last pack ?
+                $PackType = $HeadFlag -band 3
+    
+                if ($HeadFlag -band 4){
+                    $IsEncrypt = $true
+                    $saltPos = $namePos + $nameSize
+                    $Salt = new-object byte[] 8
+                    [array]::copy($buffer, $saltPos, $Salt, 0, 8)
+                }
+    
+                if (($HeadFlag -band 0xE0) -eq 0xE0){$isDir = $true}
+    
+                if ($buffer[25] -ne 0x30) {$IsCompress = $true}
+            }#end of 0x74
+    
+            default{            
+                #other block
+                if ($HeadFlag -band 0x8000){ 
+                    $PackSize = [BitConverter]::ToUInt32($buffer, 7)
+                }
+            }#end of default
+        }#end of switch
+
+        return [PSCustomObject]@{
+            HeadTypeName = $HeadTypeName; IsEncrypt = $IsEncrypt; Salt = $Salt
+            PackType = $PackType; PackOffset = $PackOffset; PackSize = $PackSize
+            FullName = $FullName; FileSize = $FileSize; IsCompress = $IsCompress
+            IsDir = $IsDir; KDFcount = $KDFcount; iv = $iv; checkValue = $checkValue
+            FileLinkType = $FileLinkType; targetName = $targetName
+        }
+    }
+
+    [PSCustomObject]getHeader5($fs, [byte[]]$buffer, [IO.FileStream]$fs0){
+    
+        $HeadTypeName = $IsEncrypt = $Salt = 
+        $PackType = $PackOffset = $PackSize =
+        $FullName = $FileSize = $IsCompress = $IsDir =
+        $KDFcount = $iv = $checkValue = $FileLinkType = $targetName = $false
+    
+        #Read CRC
+        $n = $fs.read($buffer, 0, 4)
+        if ($n -lt 4) {throw "$($fs.Name) : file size is too small"}
+    
+        #Read HeadSize
+        $n = $fs.read($buffer, 0, 3)
+        if ($n -lt 3) {throw "$($fs.Name) : file size is too small"}
+    
+        $bPos = 0
+        $HeadSize = $this.getVint($buffer, [ref]$bPos)
+
+        #crypto stream can't change position(move back)
+        $n1 = $n - $bPos
+        #[array]::Copy($buffer, $bPos, $buffer, 0, $n1)
+        for ($i = 0; $i -lt $n1; $i++){
+            $buffer[$i] = $buffer[$bPos+$i]
+        }
+        #Read Header into buffer
+        $n = $fs.read($buffer, $n1, $HeadSize - $n1)
+        if ($n -lt $HeadSize - $n1) {throw "$($fs.Name) : file size is too small"}
+        $bPos = 0
+    
+        #=============after reading  header into buffer===============
+        if ($fs0 -ne $null){ # rar header is encrypted
+            $PackOffset = $fs0.position
+        }else{
+            $PackOffset = $fs.position
+        }
+        
+        #Read HeadType  HeadFlag
+        $HeadType = $this.getVint($buffer, [ref]$bPos)
+    
+        $HeadFlag = $this.getVint($buffer, [ref]$bPos)
+    
+        switch -w ($HeadType){
+            #assume that data area is not exist in main block
+            1{$HeadTypeName = 'Main'}
+    
+            [23]{# File header or Service header
+                #Extra area size
+                if ($HeadFlag -band 1) {
+                    $this.getVint($buffer, [ref]$bPos) > $null 
+                }
+    
+                #Data area size
+                $PackSize = 0
+                if ($HeadFlag -band 2) {
+                    $PackSize = $this.getVint($buffer, [ref]$bPos)
+                }
+    
+                if ($_ -eq 2) {
+                    $HeadTypeName = 'File'
+                }else{#service header
+                    $HeadTypeName = 'Service'
+                }
+    
+                #File flags
+                $FileFlags = $this.getVint($buffer, [ref]$bPos)
+                if ($FileFlags -band 1){$isDir = $true}
+    
+                #Unpacked size
+                $FileSize = $this.getVint($buffer, [ref]$bPos)
+    
+                #Attributes
+                $this.getVint($buffer, [ref]$bPos) > $null
+    
+                #mtime
+                if ($FileFlags -band 2) {$bPos +=4}
+    
+                #Data CRC32
+                if ($FileFlags -band 4) {$bPos +=4}
+    
+                #Compression information
+                if (  ($this.getVint($buffer, [ref]$bPos)) -band 0x0380) {$IsCompress = $true}
+    
+                #Host OS
+                $this.getVint($buffer, [ref]$bPos) > $null
+    
+    
+                #file name length
+                $nameSize = $this.getVint($buffer, [ref]$bPos)
+    
+                #get file name
+                $FullName = [System.Text.Encoding]::UTF8.GetString($buffer,$bPos,$nameSize)
+                $bPos += $nameSize
+    
+                #normal pack ? first pack  ?  middle pack ? last pack ?
+                $PackType = ($HeadFlag -shr 3) -band 3
+    
+                #encrypt ?  read extra area
+                while ($bPos -lt $HeadSize){
+                    $recordSize = $this.getVint($buffer, [ref]$bPos)
+                    $recordEnd = $bPos + $recordSize
+    
+                    if ($recordEnd -gt $HeadSize){break}
+                                    
+                    #record type
+                    $recordType = $this.getVint($buffer, [ref]$bPos)
+                    if ($recordType -eq 1){#File encryption record
+                        $IsEncrypt = $true
                         
-                        for ($n = 0; $n -lt $PackSize; $n++){
-                            if ($buffer[$n] -eq 0){break}
+                        #Encryption version
+                        $this.getVint($buffer, [ref]$bPos) > $null
+    
+                        #Encryption flags
+                        $eFlag = $this.getVint($buffer, [ref]$bPos)
+    
+                        #KDF count
+                        $KDFcount = $buffer[$bPos++]
+    
+                        #salt
+                        $Salt = new-object byte[] 16
+                        [array]::Copy($buffer, $bPos, $Salt, 0, 16)
+                        $bPos += 16
+                        
+                        #iv
+                        $iv = new-object byte[] 16
+                        [array]::Copy($buffer, $bPos, $iv, 0, 16)
+                        $bPos += 16
+    
+                        #Check value
+                        if ($eFlag -band 1){
+                            $checkValue = new-object byte[] 12
+                            [array]::Copy($buffer, $bPos, $checkValue, 0, 12)
+                            $bPos += 12
+                        }
+    
+                    }elseif($recordType -eq 5){#File system redirection record
+                        $redirection = $this.getVint($buffer, [ref]$bPos)
+                        $flag1 = $this.getVint($buffer, [ref]$bPos)
+                        if ($redirection -like '[245]' -and $flag1 -eq 0){
+                            $FileLinkType = 'FileCopy'
+                            
+                            $nameSize= $this.getVint($buffer, [ref]$bPos)
+
+                            $targetName = [System.Text.Encoding]::UTF8.GetString(
+                                $buffer, $bPos, $nameSize
+                                )
+                        }else{
+                            $FileLinkType = 'FileOtherLink'
+                        }
+                        
+                    }
+                    $bPos = $recordEnd
+                }#end of while
+            }#end of [23]
+    
+            4{# Archive encryption header
+                $HeadTypeName = 'Encryption'
+                $IsEncrypt = $true
+
+                #Encryption version
+                $this.getVint($buffer, [ref]$bPos) > $null
+    
+                #Encryption flags
+                $eFlag = $this.getVint($buffer, [ref]$bPos)
+    
+                #KDF count
+                $KDFcount = $buffer[$bPos++]
+    
+                #salt
+                $Salt = new-object byte[] 16
+                [array]::Copy($buffer, $bPos, $Salt, 0, 16)
+                $bPos += 16
+    
+                #Check value
+                if ($eFlag -band 1){
+                    $checkValue = new-object byte[] 12
+                    [array]::Copy($buffer, $bPos, $checkValue, 0, 12)
+                    $bPos += 12
+                }
+            }
+
+            5{# End of archive header
+            }
+
+            default{
+                write-host "unknown header type : $HeadType"
+            }
+        }# end of switch
+    
+        return [PSCustomObject]@{
+            HeadTypeName = $HeadTypeName; IsEncrypt = $IsEncrypt; Salt = $Salt
+            PackType = $PackType; PackOffset = $PackOffset; PackSize = $PackSize
+            FullName = $FullName; FileSize = $FileSize; IsCompress = $IsCompress
+            IsDir = $IsDir; KDFcount = $KDFcount; iv = $iv; checkValue = $checkValue
+            FileLinkType = $FileLinkType; targetName = $targetName
+        }
+    }
+
+    [string]RarName4([byte[]]$buffer, [uint32]$namePos, [uint32]$nameSize){
+        $nameEnd = $namePos + $nameSize
+    
+        #search zero between usual and encoded Unicode name
+        for ($i = $namePos ; $i -lt $nameEnd ; $i++){
+            if ($buffer[$i] -eq 0) {break}
+        }
+    
+        #only ansi name
+        if ($i -eq $nameEnd){
+            return [System.Text.Encoding]::ASCII.GetString($buffer,$namePos,$nameSize)
+        }
+    
+        #===============get unicode name===============
+        $nameAnsiEnd = $i
+        $i++
+        $j = $namePos
+    
+        #HighByte of two bytes of Unicode
+        $HighByte = $buffer[$i++]
+        [byte]$FlagBits = [byte]$Flags = 0
+        $FullName = $null
+    
+        :out
+        While ($i -lt $nameEnd){
+            #after 4 times , $FlagBit become to 0 , read a byte into $Flags
+            #There are 4 flags(per flag 2bit)  in  $Flags
+            if ($FlagBits -eq 0){
+                $Flags = $buffer[$i++]
+                $FlagBits = 8
+            }
+    
+            switch ($Flags -shr 6){
+                0{#ascii stored in encoded area
+                    if ($i -ge $nameEnd){break out}
+                    $FullName += [System.Text.Encoding]::ASCII.GetString($buffer[$i++])
+                    $j++
+                }
+    
+                1{# one byte of unicode in encoded area
+                    if ($i -ge $nameEnd){break out}
+                    $FullName += [System.Text.Encoding]::Unicode.GetString(@($buffer[$i++],$HighByte))
+                    $j++
+                }
+    
+                2{# two bytes of unicode in encoded area
+                    if ($i+1 -ge $nameEnd){break out}
+                    $FullName += [System.Text.Encoding]::Unicode.GetString(@($buffer[$i],$buffer[$i+1]))
+                    $i += 2
+                    $j++
+                }
+    
+                3{#ascii stored in ansi area
+                    if ($i -ge $nameEnd){break out}
+                    
+                    #length of ascii to be read
+                    $L = $buffer[$i++]
+                    if ( ($L -band 0x80) -ne 0){
+                        if ($i -ge $nameEnd){break out}
+                        $Correction = $buffer[$i++]
+    
+                        for ($L = ($L -band 0x7F)+2 ;$L -gt 0 -and $j -lt $nameAnsiEnd ; $L-- ,$j++){
+                            $FullName += [System.Text.Encoding]::Unicode.GetString(
+                                @( (($buffer[$j] + $Correction) -band 0xFF) , $HighByte )
+                            )
+                        }
+                    }else{
+                        for ($L += 2 ;$L -gt 0 -and $j -lt $nameAnsiEnd ; $L-- ,$j++){
+                            $FullName += [System.Text.Encoding]::ASCII.GetString($buffer[$j])
                         }
                     }
-                    $h.comment = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $n)
                 }
+            }#end of switch
+            $Flags = $Flags -shl 2
+            $FlagBits -=2
+    
+        }#end of while
+    
+        return $FullName
+    }
+
+    [System.Security.Cryptography.AesCryptoServiceProvider]getAes ([byte]$Ver, [string]$password, [byte[]]$salt, [byte]$KDFcount, [byte[]]$checkValue){
+      
+        #https://github.com/lclevy/unarcrypto
+        #https://stackoverflow.com/questions/18648084/rfc2898-pbkdf2-with-sha256-as-digest-in-c-sharp
+    
+        if ($Ver -eq 4){
+            if ($null -ne $this.AesTable."$salt"){
+                return $this.AesTable."$salt"
+            }
+
+            while ($password -eq ''){
+                $local:password = read-host 'password ?'
             }
             
-        }elseif ($HeadTypeName -eq 'FileCopy'){
-            for($i = 0; $i -lt $script:Mp4InfoList.count; $i++){
-                if ($rar5E.targetName -eq $script:Mp4InfoList[$i][0].Mp4FullName){
+            $this.password = $password
 
-                    #check duplicate names
-                    $Mp4Name = split-path  $Mp4FullName  -leaf
-                                        
-                    $n = 1
-                    $Mp4BaseName = [IO.Path]::GetFileNameWithoutExtension($Mp4Name)
-                    $Mp4ExtName = [IO.Path]::GetExtension($Mp4Name)
+            $seed = [System.Text.Encoding]::Unicode.GetBytes($password) + $salt
+            
+            # in powershell , must : New-Object to create space , then copy seed to space
+            $seedNew = New-Object byte[] $seed.length
+            [array]::Copy($seed, 0, $seedNew, 0, $seed.length)
         
-                    while ($script:Mp4NameList -contains $Mp4Name){
-                        $Mp4Name = $Mp4BaseName + '-' + $n + $Mp4ExtName
-                        $n++
+            [byte[]]$iv = @(0) * 16
+            if ( ! ('SHA1SP.SHA1SP' -as [type])){Add-Type -TypeDef ([RAR]::SHA1SPdef) }
+            $sha1 = new-object SHA1SP.SHA1SP
+        
+            for($i = 0; $i -lt 16; $i++){
+                for($j = 0; $j -lt 0x4000; $j++){
+                    $count = [System.BitConverter]::GetBytes($i*0x4000 + $j)
+                    $sha1.HashCore($seedNew, 0, $seedNew.length) > $null
+                    $sha1.HashCore($count, 0, 3) >$null
+                    if ($j -eq 0){
+                        $hash = $sha1.HashForIV()
+                        $iv[$i] = $hash[19]
                     }
-
-                    $arr = $script:Mp4InfoList[$i].clone()
-                    $info = $script:Mp4InfoList[$i][0].clone()
-
-                    $info.Mp4Name = $Mp4Name
-                    $info.Mp4FullName = $Mp4FullName
-
-                    $script:Mp4InfoList += ,$arr
-                    $script:Mp4InfoList[-1].insert(0, $info)
-                    $script:Mp4InfoList[-1].RemoveAt(1)
-
-                    break
                 }
             }
-        }
-
-        return 9, $PackOffset, $PackSize
-    }
-
-    #=== previous pack and current pack are parts of the same file ? ===
-    $Mp4Info = $h.Mp4Info
-
-    if ($h.nextPartN -ne $null){
-        $SameFile = $false
-
-            #middle pack or last pack 
-        if ($PackType -eq 3 -or $PackType -eq 1){
-            if ($h.Mp4FullName_now -eq $Mp4FullName -and $h.Mp4Size_now -eq $Mp4Size){
-                $SameFile = $true
-            }
-        }
-
-        if ( ! $SameFile){ mp4Ending  $h }
-    }# end of if $h.nextPartN -ne $null
-
-    #============= process current pack ======================
-    if ($compression) {
-        Write-Host "$Mp4FullName :`n can't process compressed file"
-        if ($Mp4Size -lt 1MB){$script:srtIscompressed = $true}
-        return $PackType, $PackOffset, $PackSize
-    }
-
-    if($isDir){
-        if ($script:MakeFolder){
-            $FolderPath = $Mp4FullName -replace '/','\'
-            $script:Mp4Folders.$FolderPath = $null
-        }
-
-        return $PackType, $PackOffset, $PackSize
-    }
-
-
-    # mp4size not matched when search other source 
-    if ($script:h0 -ne $null -and $script:h0.Mp4Size_now -ne $Mp4Size){
-        return $PackType, $PackOffset, $PackSize
-    }
-
-    if ($h.nextPartN -eq $null){ # first time meet
-        $h.Mp4Info = [System.Collections.ArrayList]@()
-        
-        $h.Mp4FullName_now = $h.Mp4Size_now = $h.FullPack = $h.midPackSize =
-        $h.nEmpty = $h.FileEncrypt = $null 
-
-        $Mp4Info = $h.Mp4Info
-
-        if ($PackType -eq 1 -or $PackType -eq 3) {# first pack missing                
-            [void]$Mp4Info.add($null)
-        }
+            $hash = $sha1.HashFinal()
+            [byte[]]$key = $hash[3..0] + $hash[7..4] + $hash[11..8] + $hash[15..12]
     
-        $Mp4Name = split-path  $Mp4FullName  -leaf
+        }elseif ($Ver -eq 5){
 
-        if ( ! $script:MakeFolder){
-            #check duplicate names
-            $n = 1
-            $Mp4BaseName = [IO.Path]::GetFileNameWithoutExtension($Mp4Name)
-            $Mp4ExtName = [IO.Path]::GetExtension($Mp4Name)
+            if ($null -ne $this.AesTable."$checkValue"){
+                return $this.AesTable."$checkValue"
+            }
+
+            while ($password -eq ''){
+                $local:password = read-host 'password ?'
+            }
             
-            while ($script:Mp4NameList -contains $Mp4Name){
-                $Mp4Name = $Mp4BaseName + '-' + $n + $Mp4ExtName
-                $n++
-            }
-        }
-
-
-        $Mp4offset = 0
-
-        $h.FullPack = $Mp4Size
-        if ($FileEncrypt){
-            $h.FileEncrypt = $true
-            if ($Mp4Size % 16) {$h.FullPack += 16 - ($Mp4Size % 16)}
-        }
-
-        $h.Mp4FullName_now = $Mp4FullName
-        $h.Mp4Size_now = $Mp4Size
+            $this.password = $password
+    
+            while ($true){
+                $h256 =  new-object System.Security.Cryptography.HMACSHA256
+                $h256.Key = [System.Text.Encoding]::UTF8.GetBytes($password)
         
-    }else{# meet again
-        $Mp4Info = $h.Mp4Info
-        $Mp4offset = $Mp4Info[-1].Mp4offset + $Mp4Info[-1].length
-
-        [int]$partN = $file.basename -replace '.*part',''
-
-        # missing *.part.rar  or previous pack is not complete
-        if ($partN -gt $h.nextPartN  -or  $h.nEmpty -gt 0){
-
-            if ($PackType -eq 3){ # middle pack
-                $nEmpty = $PackSize * ($partN - $h.nextPartN) + $h.nEmpty
-                [void]$Mp4Info.add(  @{fs = $null; Mp4offset = $Mp4offset; length = $nEmpty}  )
-                $Mp4offset += $nEmpty
-            }else{ # last pack
-                if ($Mp4Info[0] -eq $null){ # $Mp4offset is fake
-                    $nEmpty = $h.midPackSize * ($partN - $h.nextPartN) + $h.nEmpty
+                $u = $h256.ComputeHash($salt + (0,0,0,1))
                 
-                }else{# $Mp4offset is true
-                    $nEmpty = $h.FullPack -$PackSize - $Mp4offset
+                $key = $u
+              
+                $count = 1 -shl $KDFcount
+                for ($i = 1; $i -lt $count; $i++){
+                    $u = $h256.ComputeHash($u)
+                    for ($j = 0; $j -lt $key.count; $j++){
+                        $key[$j] = $key[$j] -bxor $u[$j]
+                    }
                 }
-                [void]$Mp4Info.add(  @{fs = $null; Mp4offset = $Mp4offset; length = $nEmpty} )
-                $Mp4offset = $h.FullPack - $PackSize
-            }
-            $h.nEmpty = 0
-        }
-    }
-   
-    #file is incomplete ?
-    if ($PackOffset + $PackSize -gt $fs.length) {
-        $h.nEmpty = $PackOffset + $PackSize - $fs.length
-    }
-    
-    [void]$Mp4Info.add( @{Mp4offset = $Mp4offset
-        FSoffset = $PackOffset ; length = $PackSize - $h.nEmpty}  )
-    
-    if ($PackType -eq 0){
-        if ($h.fsForType0 -ne $null){
-            $Mp4Info[-1].fs = $h.fsForType0
-        }else{
-            $h.fsForType0 = $file.OpenRead()
-            $Mp4Info[-1].fs = $h.fsForType0
-        }
-    }else{
-        $Mp4Info[-1].fs = $file.OpenRead()
-    }
-    
-    if ($h.nextPartN -eq $null){
-        $Mp4Info[-1].Mp4Name = $Mp4Name
-        $Mp4Info[-1].Mp4Size = $Mp4Size
-        $Mp4Info[-1].Mp4FullName = $Mp4FullName
-
-        if ($script:MakeFolder){
-            $FolderPath = Split-Path $Mp4FullName
-            if ($FolderPath -ne ''){
-                $Mp4Info[-1].FolderPath = @($FolderPath)
-                $script:Mp4Folders.$FolderPath = $null
-            }
-        }
-    }
-    
-    if ($FileEncrypt){
-        $key, $iv =  getAESKeyIV  $h  $salt $rar5E
-        if ($h.rarVer -eq 5){$iv = $rar5E.iv}
-
-        $Mp4Info[-1].aes = new-object System.Security.Cryptography.AesCryptoServiceProvider
-        $Mp4Info[-1].aes.Key = $key
-        $Mp4Info[-1].aes.IV = $iv
         
-        # Padding  none
-        $Mp4Info[-1].aes.Padding = 1
-    }
+                $v2 = New-Object byte[] 32
+                [array]::Copy($key, 0, $v2, 0, 32)
+                for ($i = 0 ; $i -lt 32; $i++){
+                    $u = $h256.ComputeHash($u)
+                    for ($j = 0; $j -lt $v2.count; $j++){
+                        $v2[$j] = $v2[$j] -bxor $u[$j]
+                    }
+                }
+        
+                if ($null -eq $checkValue){ # have no checkValue
+                    break
     
-    if ($PackType -eq 3) {$h.midPackSize = $PackSize}
+                }else{# have checkValue
+                    $check8 = new-object byte[] 8
+        
+                    for ($i = 0; $i -lt 32; $i++){
+                        $check8[$i % 8] = $check8[$i % 8] -bxor $v2[$i]
+                    }
+        
+                    if ("$check8" -eq $checkValue[0..7]){#pass ok
+                        break
+                        
+                    }else{#pass error
+                        Write-Host 'password error'
+    
+                        $local:password = ''
+                        while ($password -eq ''){
+                            $local:password = read-host 'password ?'
+                        }
+                        
+                        $this.password = $password
+                    }
+                }
+    
+            }# end of while
 
-    if ($PackType -eq 2 -or $PackType -eq 3) { # first pack or middle pack
-        #next RAR part number
-        $h.nextPartN = 1 + $( $file.basename -replace '.*part','' )
+            #rar 5 : iv is not yet set
+            [byte[]]$iv = @(0) * 16
+            
+        }else{throw 'RAR version error'}
 
-    }elseif ($PackType -eq 1){
-        if ($Mp4Info[0] -eq $null){
-            # correct Mp4offset
-            $Mp4Info[-1].Mp4offset = $h.FullPack - $PackSize
-            if ($Mp4Info.count -gt 2){
-                $L = $Mp4Info[-1].Mp4offset - ($Mp4Info[-2].Mp4offset + $Mp4Info[-2].length)
-                1 .. ($Mp4Info.count - 2) | %{ $Mp4Info[$_].Mp4offset += $L }
-            }
-            $Mp4Info[0] = @{fs = $null; Mp4offset = 0; length = $Mp4Info[1].Mp4offset
-                Mp4Name = $Mp4Info[1].Mp4Name; Mp4Size = $Mp4Info[1].Mp4Size
-                Mp4FullName = $Mp4Info[1].Mp4FullName}
+        $Aes = new-object System.Security.Cryptography.AesCryptoServiceProvider -Prop @{
+            Key = $key
+            IV = $iv
         }
-        if ($h.nEmpty){
-            $Mp4offset = $Mp4Info[-1].Mp4offset + $Mp4Info[-1].length
-            [void]$Mp4Info.add( @{fs = $null; Mp4offset = $Mp4offset; length = $h.nEmpty}  )
+        # Padding  none
+        $Aes.Padding = 1
+
+        if ($Ver -eq 4){
+            $this.AesTable."$salt" = $Aes
+        }else{
+            $this.AesTable."$checkValue" = $Aes
         }
-
-        if ($FileEncrypt){ adjustRange $Mp4Info }
-
-        $h.nextPartN = -1
-    }elseif($PackType -eq 0){
-        $h.nextPartN = -1
+        
+    
+        return $Aes
     }
 
-    return $PackType, $PackOffset, $PackSize
+    [uint64]getVint([byte[]]$buffer, [ref]$bPos){
+        $bPosOld = $bPos.Value
+        
+        while ($buffer[$bPos.Value++] -band 0x80) {}
+    
+        if ( ($bPos.Value - $bPosOld) -gt 9 ){throw 'Vint : too many bytes'}  # 7 * 9 = 63
+    
+        [uint64]$data = $n = 0
+    
+        while ($bPosOld -lt $bPos.Value){
+            [uint64]$d = $buffer[$bPosOld++] -band 0x7F
+            $data +=  $d -shl  (7 * $n++)
+        }
+        return $data
+    }
+
 }
 
-function rebuildMp4($Mp4Info){
-    # mp4 only
-    [byte[]]$pattern = (,0 * 11) + 1 + (,0 *15) + 1 + (,0 * 14) + 64 + (,0 * 29)
+class rarEntry{
+    [string]$Name = ''
+    [string]$FullName = ''
+    [uint64]$Size = 0
+    [bool]$IsDir = $false
 
+    [bool]$IsCompress = $false
+    [bool]$IsEncrypt = $false
+    [byte[]]$iv0 = @()
+    [System.Security.Cryptography.AesCryptoServiceProvider]$Aes = $null
+
+    [IO.FileInfo]$rarFileInfo = $null
+    [byte]$PackType = 0
+    [uint64]$PackOffset = 0
+    [uint64]$PackSize = 0
+    [uint64]$ActualPackSize = 0
+
+    rarEntry([PSCustomObject]$result){
+        $this.FullName = $result.FullName
+        $this.Name = Split-Path $result.FullName -Leaf
+        $this.Size = $result.FileSize
+        $this.IsDir = $result.IsDir
+
+        $this.IsCompress = $result.IsCompress
+        $this.IsEncrypt = $result.IsEncrypt
+        
+        $this.PackType = $result.PackType
+        $this.PackOffset = $result.PackOffset
+        $this.PackSize = $result.PackSize
+    }
+}
+
+class File{
+    [int]$nameCount = 0
+    [int]$fileType = 0
+    [int]$fileFlags = 0
+
+    [long]$openId = 0
+    [long]$fileId = 0
+
+    [long]$createTime = 0
+    [long]$accessTime = 0
+    [long]$writeTime = 0
+    [long]$changeTime = 0
+
+    [long]$fileSize = 0
+    [System.Collections.SortedList]$children = $null
+
+    [bool]$IsEncrypt = $false
+    [System.Security.Cryptography.AesCryptoServiceProvider]$Aes = $null
+    [PSCustomObject[]]$Parts = @()
+    <# members of PSCustomObject
+    [IO.FileStream]$fs = $null
+    [uint64]$fsOffset = 0
+    [uint64]$Len = 0
+    [uint64]$MountFileOffset = 0
+    [byte[]]$iv0 = $null
+    #>
+
+    File([rarEntry]$entry){
+
+        $this.fileSize = $entry.Size
+        if($entry.IsDir){
+            $this.fileType = 2
+            $this.children = [System.Collections.SortedList]::new()
+        }else{
+            $this.fileType = 1
+        }
+
+        $this.IsEncrypt = $entry.IsEncrypt
+        $this.Aes = $entry.Aes
+    }
+
+    File([int]$inFileType, [int]$inFileFlags, [long]$inWriteTime){
+        $this.fileType = $inFileType
+        $this.fileFlags = $inFileFlags
+        $this.createTime = $inWriteTime
+        $this.accessTime = $inWriteTime
+        $this.writeTime = $inWriteTime
+        $this.changeTime = $inWriteTime
+        $this.children = [System.Collections.SortedList]::new()
+    }
+
+    static [File]makeFile([rarEntry[]]$entries, [uint32]$index, [hashtable]$FsTable){
+
+        $File = $null
+        $nextPartN = $nEmpty = $MountFileOffset = $midPackSize = $FullPack = 0
+
+        while($true){
+            $entry = $entries[$index]
+
+            # for multi part entry
+            [uint32]$partN = 0
+            if ($entry.PackType -gt 0){
+                $partN = $entry.rarFileInfo.BaseName -replace '.*part',''
+            }
+
+            if ($File -eq $null){ # first time meet
+                $File = [File]::new($entry)
+                $MountFileOffset = $midPackSize = $nEmpty = 0
+
+                $FullPack = $entry.Size
+                if ($entry.IsEncrypt -and ($entry.Size % 16)){
+                    $FullPack += 16 - ($entry.Size % 16)
+                }
+
+                if ($entry.PackType -eq 1 -or $entry.PackType -eq 3) {# first pack missing                
+                    $File.Parts += @($null)
+                }
+
+            }else{ # meet again
+
+                # missing *.part.rar  or previous pack is not complete
+                if ($partN -gt $nextPartN  -or  $nEmpty -gt 0){
+                    if ($entry.PackType -eq 3){ # middle pack
+                        $nEmpty = $entry.PackSize * ($partN - $nextPartN) + $nEmpty
+
+                        $File.Parts += [PSCustomObject]@{
+                            fs = $null
+                            fsOffset = 0
+                            Len = $nEmpty
+                            MountFileOffset = $MountFileOffset
+                            iv0 = $null
+                        }
+                        $MountFileOffset += $nEmpty
+
+                    }else{ # last pack
+                        if ($File.Parts[0] -eq $null){ # MountFileOffset is fake
+                            $nEmpty = $midPackSize * ($partN - $nextPartN) + $nEmpty
+
+                        }else{# $MountFileOffset is true
+                            $nEmpty = $FullPack - $entry.PackSize - $MountFileOffset
+                        }
+
+                        $File.Parts += [PSCustomObject]@{
+                            fs = $null
+                            fsOffset = 0
+                            Len = $nEmpty
+                            MountFileOffset = $MountFileOffset
+                            iv0 = $null
+                        }
+
+                        $MountFileOffset = $FullPack - $entry.PackSize
+                    }# end of if ($entry.PackType -eq 3){}else
+
+                }# end of if ($partN -gt $nextPartN  -or  $nEmpty -gt 0)
+            }# end of if ($mountFile  -eq $null){}else
+
+            if ($entry.PackType -eq 1) {$MountFileOffset = $FullPack - $entry.PackSize}
+
+            $File.Parts += [PSCustomObject]@{
+                fs = $FsTable[$entry.rarFileInfo]
+                fsOffset = $entry.PackOffset
+                Len = $entry.ActualPackSize
+                MountFileOffset = $MountFileOffset
+                iv0 = $entry.iv0
+            }
+
+            $MountFileOffset += $entry.ActualPackSize
+
+            # pack is incomplete ?
+            $nEmpty = 0
+            if ($entry.ActualPackSize -lt  $entry.PackSize) {
+                $nEmpty = $entry.PackSize - $entry.ActualPackSize
+            }
+
+            if ($entry.PackType -eq 3) {$midPackSize = $entry.PackSize}
+
+            if ($entry.PackType -eq 2 -or $entry.PackType -eq 3) { # first pack or middle pack
+                #next RAR part number
+                $nextPartN = 1 + $partN
+            }
+            
+            # single pack or last pack
+            if($entry.PackType -eq 0 -or $entry.PackType -eq 1 -or
+                ($index+1) -eq $entries.Count -or $entry.FullName -ne $entries[$index+1].FullName ){
+
+                if ($File.Parts[0] -eq $null){
+                    if ($entry.PackType -eq 3){$File = $null; continue}
+
+                    if ($entry.PackType -eq 1){ # to correct MountFileOffset
+
+                        $local:parts = $File.Parts
+
+                        if ($parts.count -gt 2){
+                            $L = $parts[-1].MountFileOffset - ($parts[-2].MountFileOffset + $parts[-2].Len)
+                            1 .. ($parts.Count - 2) | %{ $parts[$_].MountFileOffset += $L }
+                        }
+                        $local:parts[0] = [PSCustomObject]@{
+                            fs = $null
+                            fsOffset = 0
+                            Len = $parts[1].MountFileOffset
+                            MountFileOffset = 0
+                            iv0 = $null
+                        }
+                    }
+                }
+
+                if ($MountFileOffset -lt $FullPack){
+                    $File.Parts += [PSCustomObject]@{
+                        fs = $null
+                        fsOffset = 0
+                        Len = $FullPack - $MountFileOffset
+                        MountFileOffset = $MountFileOffset
+                        iv0 = $null
+                    }
+                }
+
+                if ($File.IsEncrypt){$File.fixFileRange()}
+                if ($File.Parts[0].fs -eq $null -and $entry.Name -like '*.mp4'){
+                    $r = $File.rebuildMp4Head()
+                    if (! $r){$File = $null}
+                }
+
+                break
+            }
+
+            $index++
+        }
+        return $File
+    }
+
+    [void]fixFileRange(){
+        if (! $this.IsEncrypt){return}
+
+        $local:parts = $this.Parts
+        if ($parts.Count -lt 2){return}
+
+        ($parts.Count - 1) .. 1 | %{
+            $current = $parts[$_]
+            $prev = $parts[$_ - 1]
+            $n = $current.MountFileOffset % 16
     
-    [byte[]]$Bc = @(72) * 256
-    $Bc[0] = 1; $Bc[1] = 11; $Bc[64] = 42
+            if ($current.fs -eq $null){
+                if ($prev.fs -ne $null -and $n){
+                    $current.MountFileOffset -= $n
+                    $current.Len += $n
+                    $prev.Len -= $n
+                }
     
-    [byte[]]$Gs = 1,10,9,8,7,6,5,4,3,2,1,12,72,72,72,72,72,72,
-    72,72,72,72,72,72,72,72,16,72,72,72,61,72,72,72,72,72,72,
-    72,72,72,72,72,72,72,72,61,72,72,72,72,72,72,72,72,72,72,
-    72,72,72,72,72,61,72,72,72,72,72,72,72,72,72,72
+            }else{ # $current.fs -ne $null
+                if ($prev.fs -ne $null){
+                    if ($n){
+                        $blockIV = New-Object byte[] 16
+                        $blockEncrypted = New-Object byte[] 16
+                        $blockOut = New-Object byte[] 16
     
+                        # $pre.Len should greater than 31 .   no check here
+                        $prev.fs.position = $prev.fsOffset + $prev.Len - ($n + 16)
+                        [void]$prev.fs.read($blockIV, 0, 16)
+                        [void]$prev.fs.read($blockEncrypted, 0, $n)
+                        
+                        $current.fs.position = $current.fsOffset
+                        [void]$current.fs.read($blockEncrypted, $n, 16 - $n)
+    
+                        $current.Aes.IV = $blockIV
+    
+                        [void]$current.Aes.CreateDecryptor().TransformBlock($blockEncrypted, 0, 16, $blockOut, 0)
+    
+                        $current.iv0 = $blockEncrypted
+                        $current.MountFileOffset += 16 - $n
+                        $current.fsOffset += 16 - $n
+                        $current.Len -= 16 - $n
+    
+                        $prev.Len -= $n
 
-    [uint32]$searchSize = 20MB
-    write-host searching moov
-    $time1 = get-date
-    $bufferPos = BmBackward $Mp4Info  -1  -1  $pattern  $searchSize  $Bc  $Gs
+                        $partInsert = [PSCustomObject]@{
+                            fs = [System.IO.MemoryStream]::new($blockOut)
+                            fsOffset = 0
+                            Len = 16
+                            MountFileOffset = $current.MountFileOffset - 16
+                            iv0 = $null
+                        }
+                        
+                        $lastIndex = $parts.Count - 1
+                        $prevIndex = $_ - 1
+                        $parts = @($parts[0 .. $prevIndex]) + @($partInsert) + @($parts[$_ .. $lastIndex])
+                        $this.Parts = $parts
+    
+                    }else{ # $n -eq 0
+                        $blockIV = New-Object byte[] 16
+                        $prev.fs.position = $prev.fsOffset + $prev.Len - 16
+                        [void]$prev.fs.read($blockIV, 0, 16)
+    
+                        $current.iv0 = $blockIV
+                    }
+                }else{# $prev.fs -eq $null
+                    $blockIV = New-Object byte[] 16
+                    
+                    if ($n){
+                        $current.fs.position = $current.fsOffset + (16 - $n)
+                        [void]$current.fs.read($blockIV, 0, 16)
+    
+                        $current.MountFileOffset += 32 - $n
+                        $current.fsOffset += 32 - $n
+                        $current.Len -= 32 - $n
+    
+                        $prev.Len += 32 - $n
+                    }else{# $n -eq 0
+                        $current.fs.position = $current.fsOffset
+                        [void]$current.fs.read($blockIV, 0, 16)
+    
+                        $current.MountFileOffset += 16
+                        $current.FSoffset += 16
+                        $current.Len -= 16
+    
+                        $prev.Len += 16
+                    }
+    
+                    $current.iv0 = $blockIV  
+                }# end of $prev -eq $null
+            }# end of $current -eq $null
+        }# end of foreach
+    }
 
-    $time2=get-date
-    write-host ($time2-$time1)
-    #========================after searching========================
-    if ($bufferPos -eq -1) {
-        write-host moov not found
-        return  $false
-    }else{ #moov found
-        write-host moov found
-        $moovPos = $Mp4Info[0].Mp4Size - $searchSize + $bufferPos - 42
+    [bool]rebuildMp4Head(){
+        if($this.Parts[0].fs -ne $null){return $true}
 
+        write-host searching moov
+        $time1 = get-date
+
+        # mp4 only
+        [byte[]]$pattern = (,0 * 11) + 1 + (,0 *15) + 1 + (,0 * 14) + 64 + (,0 * 29)
+
+        
+        [byte[]]$Bc = @(72) * 256
+        $Bc[0] = 1; $Bc[1] = 11; $Bc[64] = 42
+        
+        [byte[]]$Gs = 1,10,9,8,7,6,5,4,3,2,1,12,72,72,72,72,72,72,
+        72,72,72,72,72,72,72,72,16,72,72,72,61,72,72,72,72,72,72,
+        72,72,72,72,72,72,72,72,61,72,72,72,72,72,72,72,72,72,72,
+        72,72,72,72,72,61,72,72,72,72,72,72,72,72,72,72
+
+        [uint32]$searchSize = 17MB
+        if ($this.fileSize -lt $searchSize){$searchSize = $this.fileSize}
+
+        $buffer = new-object byte[] ($searchSize)
+        $searchStart = $this.fileSize - $searchSize
+        $this.Read($buffer, $searchStart, $searchSize) > $null
+
+        $bufferPos = $searchSize - $pattern.length
+        while ($bufferPos -ge 0){
+            for ($i = 0; $i -lt $pattern.length -and $pattern[$i] -eq $buffer[$bufferPos + $i]; $i++){}
+        
+            if ($i -eq $pattern.length){
+                break
+            }else{
+                if ($Bc[  $buffer[$bufferPos+$i] ] - $i -gt $Gs[$i]){
+                    $bufferPos -= $Bc[  $buffer[$bufferPos+$i] ] - $i
+                }else{
+                    $bufferPos -= $Gs[$i]
+                }
+            }
+        }#end of while 
+        $buffer = $null
+
+        $time2=get-date
+        write-host ($time2-$time1)
+        if ($bufferPos -lt 0){Write-Host 'moov not found'; return $false}
+        Write-Host "moov found (at -$($searchSize - $bufferPos + 42))"
+
+        $moovPos = $searchStart + $bufferPos - 42
 
         [byte[]]$ftypData = 0,0,0,0x20,0x66,0x74,0x79,0x70,0x69,0x73,0x6F,0x6D,0,0,
                             2,0,0x69,0x73,0x6F,0x6D,0x69,
                             0x73,0x6F,0x32,0x61,0x76,0x63,0x31,0x6D,0x70,0x34,0x31
+        
         $mdatSize = $moovPos - 32
-        if ( $mdatSize -lt 4GB ){
+        if ($mdatSize -lt 4GB){
             $arr = [BitConverter]::GetBytes([uint32]$mdatSize)
             [array]::Reverse($arr)
             [byte[]]$mdatHead = $arr + 0x6D,0x64,0x61,0x74
@@ -1360,776 +1507,223 @@ function rebuildMp4($Mp4Info){
             [array]::Reverse($arr)
             [byte[]]$mdatHead = 0,0,0,1 + 0x6D,0x64,0x61,0x74 + $arr
         }
-        [byte[]]$buffer = $ftypData + $mdatHead
-        
-        $Mp4Info[0].buffer = $buffer
-        $Mp4Info[0].length = $buffer.Length
-        
-        $Mp4Info.insert(1, @{fs = $null; Mp4offset = $buffer.Length})
 
-        $Mp4Info[1].length = $Mp4Info[2].Mp4offset - $Mp4Info[1].Mp4offset
+        $this.Parts[0].fs = [System.IO.MemoryStream]::new($ftypData + $mdatHead)
+        $this.Parts[0].Len = $ftypData.Count + $mdatHead.Count
+
+        $partInsert = [PSCustomObject]@{
+            fs = $null
+            fsOffset = 0
+            Len = 0
+            MountFileOffset = $ftypData.Count + $mdatHead.Count
+            iv0 = $null
+        }
+        
+        $local:parts = $this.Parts
+        $lastIndex = $parts.Count - 1
+        $local:parts = @($parts[0]) + @($partInsert) + @($parts[1 .. $lastIndex])
+        $parts[1].Len = $parts[2].MountFileOffset - $parts[1].MountFileOffset
+
+        $this.Parts = $parts
 
         return $true
-    }#end of moov found
-}
-
-function readBackward($Mp4Info, [int32]$i, [int32]$offset, [uint32]$readSize, $buffer){
-
-    $partLen = $offset + 1
-    $partPos = 0
-    if ($readSize -lt $partLen){
-        $partPos = $partLen - $readSize
-        $partLen = $readSize
     }
 
-    $bufferPos = $readSize - $partLen
+    [uint64]Read([byte[]]$buffer, [uint64]$startPos, [uint64]$Len){
+        if ($startPos -ge $this.fileSize){return 0}
 
-    $readSize1 = $readSize
-    while($readSize1 -gt 0){
-        if ($Mp4Info[$i].fs -ne $null){
-            if ($Mp4Info[$i].aes -eq $null){
-                $Mp4Info[$i].fs.position = $Mp4Info[$i].FSoffset + $partPos
-                [void]$Mp4Info[$i].fs.read($buffer, $bufferPos, $partLen)
-            }else{
-                DecryptToBuffer  $Mp4Info  $i $partPos  $buffer  $bufferPos  $partLen
-            }
-
-        }elseif ($null -ne $Mp4Info[$i].buffer ){
-            [array]::Copy($Mp4Info[$i].buffer, $partPos, $buffer, $bufferPos, $partLen)
+        if ($startPos + $Len -gt $this.fileSize){
+            $Len = $this.fileSize - $startPos
         }
 
-        $readSize1 -= $partLen
-
+        $local:parts = $this.Parts
+        for ($i = 1; $i -lt $parts.count; $i++){
+            if ($startPos -lt $parts[$i].MountFileOffset){break}
+        }					
         $i--
-        if ($i -lt 0){ break }
-        if ($Mp4Info[$i].fs -eq $null -and  $null -eq $Mp4Info[$i].buffer) {break}
 
-        $partLen = $Mp4Info[$i].length
-        $partPos = 0
-        if ($readSize1 -lt $partLen){
-            $partPos = $partLen - $readSize1
-            $partLen = $readSize1
-        }
+        $bufferPos = 0
+        $partPos = $startPos - $parts[$i].MountFileOffset
+        $partLen = $parts[$i].Len - $partPos
+        $Len1 = $Len
+
+        while ($Len1 -gt 0){
     
-        $bufferPos = $readSize1 - $partLen
-    }#end of while
-    return $bufferPos
-}
-function BmBackward{
-    param($Mp4Info, [int32]$i, [int32]$offset,
-        $pattern,  [uint32]$searchSize = 20MB, $Bc = $null, $Gs = $null
-    )
-
-    if ($i -lt 0){ $i = $Mp4Info.count + $i }
-
-    if ($Mp4Info[$i].fs -eq $null -and  $null -eq $Mp4Info[$i].buffer){
-        return -1
-    }
-    
-    if ($offset -lt 0){ $offset = $Mp4Info[$i].length + $offset}
-    if ( $Mp4Info[$i].Mp4offset + $offset + 1 -gt $Mp4Info[0].Mp4Size){
-        $offset = $Mp4Info[0].Mp4Size - $Mp4Info[$i].Mp4offset - 1
-    }
-    
-
-    $buffer = new-object byte[]($searchSize)
-
-    $rangeStart = readBackward $Mp4Info  $i  $offset  $searchSize  $buffer
-    $rangeEnd = $searchSize
-    
-    if ($rangeEnd - $rangeStart -lt $pattern.length){
-        write-host moov not found
-        $buffer = $null
-        return -1  # moovPos
-    }
-    #==================================
-    if ($null -eq $Bc -or $null -eq $Gs){
-        $Bc = @( $pattern.Length ) * 256
-
-        for ( $i = $pattern.Length - 1 ; $i -ge 1  ; $i-- ){
-            [int]$badChar = $pattern[$i]
-            $Bc[ $badChar ] =  $i
-        }
-
-        #=====
-        $Gs = @( $pattern.Length ) * $pattern.Length
-        $good = 0
-        $defaultMove = $pattern.Length
-
-        for($test = $pattern.Length - 1; $test -ge 1; $test--){
-            $g = $good
-            $t = $test
-
-            for ( ; $t -le $pattern.Length - 1 ; $g++,$t++){
-                if ($pattern[$g] -ne $pattern[$t]) {break}
-            }
-
-            if ($t -eq $test){
-                $Gs[$pattern.Length - $t ] = $defaultMove
-            }elseif($t -eq $pattern.Length){
-                $Gs[$g] = $test - $good
-
-                $defaultMove = $test - $good
+            if ($Len1 -gt $partLen){
+                $readSize = $partLen
             }else{
-                $Gs[$g] = $test - $good
-            }
-        }
-
-        $Gs[0] = 1
-    }
-    #==================================
-
-    $bufferPos = $rangeEnd - $pattern.length
-
-    while ($bufferPos -ge $rangeStart){
-        for ($i = 0; $i -lt $pattern.length -and $pattern[$i] -eq $buffer[$bufferPos + $i]; $i++){}
-    
-        if ($i -eq $pattern.length){
-            break
-        }else{
-            if ($Bc[  $buffer[$bufferPos+$i] ] - $i -gt $Gs[$i]){
-                $bufferPos -= $Bc[  $buffer[$bufferPos+$i] ] - $i
-            }else{
-                $bufferPos -= $Gs[$i]
-            }
-        }
-    }#end of while 
-    $buffer = $null
-
-    if ($bufferPos -lt $rangeStart){
-        return -1
-    }else{
-        return  $bufferPos
-    }
-}
-
-function readForward($Mp4Info, [int32]$i, [int32]$offset, [uint32]$readSize, $buffer){
-    $partLen = $Mp4Info[$i].length - $offset
-    $partPos = $offset
-    if ($readSize -lt $partLen){ $partLen = $readSize }
-
-    $bufferPos = 0
-
-    $readSize1 = $readSize
-    while($readSize1 -gt 0){
-        if ($Mp4Info[$i].fs -ne $null){
-            if ($Mp4Info[$i].aes -eq $null){
-                $Mp4Info[$i].fs.position = $Mp4Info[$i].FSoffset + $partPos
-                [void]$Mp4Info[$i].fs.read($buffer, $bufferPos, $partLen)
-            }else{
-                DecryptToBuffer  $Mp4Info  $i $partPos  $buffer  $bufferPos  $partLen
+                $readSize = $Len1
             }
 
-        }elseif ($null -ne $Mp4Info[$i].buffer){
-            [array]::Copy($Mp4Info[$i].buffer, $partPos, $buffer, $bufferPos, $partLen)
-        }
-
-        $readSize1 -= $partLen
-        $bufferPos += $partLen
-
-        $i++
-        if ($i -eq $Mp4Info.count){ break }
-        if ($Mp4Info[$i].fs -eq $null -and $null -eq $Mp4Info[$i].buffer) {break}
-
-        $partLen = $Mp4Info[$i].length
-        if ($i -eq $Mp4Info.count - 1){
-            if ($Mp4Info[-1].Mp4offset + $Mp4Info[-1].length -gt  $Mp4Info[0].Mp4Size){
-                $partLen = $Mp4Info[0].Mp4Size - $Mp4Info[-1].Mp4offset
-            }
-        }
-        $partPos = 0
-        if ($readSize1 -lt $partLen){ $partLen = $readSize1 }
-    
-    }#end of while
-    return $bufferPos
-}
-function BmForward{
-    param($Mp4Info, [int32]$i, [int32]$offset,
-        $pattern,  [uint32]$searchSize = 20MB, $Bc = $null, $Gs = $null
-    )
-
-    if ($i -lt 0){ $i = $Mp4Info.count + $i }
-
-    if ($Mp4Info[$i].fs -eq $null -and $null -eq $Mp4Info[$i].buffer){
-        return -1
-    }
-    
-    if ($offset -lt 0){ $offset = $Mp4Info[$i].length + $offset}
-    
-
-    $buffer = new-object byte[]($searchSize)
-
-    $rangeStart = 0
-    $rangeEnd = readForward $Mp4Info  $i  $offset  $searchSize  $buffer
-    
-    if ($rangeEnd - $rangeStart -lt $pattern.length){
-        write-host moov not found
-        $buffer = $null
-        return -1  # moovPos
-    }
-    #==================================
-    if ($null -eq $Bc -or $null -eq $Gs){
-        $Bc = @( $pattern.Length ) * 256
-
-        for ( $i = 0 ; $i -le $pattern.Length - 2  ; $i++ ){
-            [int]$badChar = $pattern[$i]
-            $Bc[ $badChar ] = $pattern.Length - 1 - $i
-        }
-
-        #=====
-        $Gs = @( $pattern.Length ) * $pattern.Length
-        $good = $pattern.Length - 1
-        $defaultMove = $pattern.Length
+            if ($parts[$i].fs -ne $null){
+                if($parts[$i].fs -is [System.IO.MemoryStream] -or $this.Aes -eq $null){ # ms or fs
+                    
+                    $parts[$i].fs.Position = $parts[$i].fsOffset + $partPos
+                    [void]$parts[$i].fs.read($buffer, $bufferPos, $readSize)
+                }else{ # cs
+                    $n = $partPos % 16
         
-        for($test = 0; $test -le $pattern.Length - 2; $test++){
-            $g = $good
-            $t = $test
-        
-            for ( ; $t -ge 0 ; $g--,$t--){
-                if ($pattern[$g] -ne $pattern[$t]) {break}
-            }
-        
-            if ($t -eq $test){
-                $Gs[$good - $test -1 ] = $defaultMove
-            }elseif($t -eq -1){
-                $Gs[$g] = $good - $test
-        
-                $defaultMove = $good - $test
-            }else{
-                $Gs[$g] = $good - $test
-            }
-        }
-        
-        $Gs[$pattern.Length - 1] = 1
-    }
-    #==================================
-
-    $bufferPos = 0
-
-    while ($bufferPos -lt $rangeEnd - $pattern.Length + 1){
-        for ($i = $pattern.Length - 1; $i -ge 0 -and $pattern[$i] -eq $buffer[$bufferPos + $i]; $i--){}
+                    if ($partPos -ge 16){
+                        $parts[$i].fs.Position = $parts[$i].fsOffset + $partPos - $n - 16
+                        $blockIV = New-Object byte[] 16
+                        [void]$parts[$i].fs.read($blockIV, 0, 16)
     
-        if ($i -eq -1){
-            break
-        }else{
-            $badChar = $buffer[$bufferPos + $i]
-            $B_move = $Bc[ $badChar ] - ($pattern.Length -1 - $i)
-
-            if ($B_move -gt $Gs[$i]){
-                $bufferPos += $B_move
-            }else{
-                $bufferPos += $Gs[$i]
-            }
-        }
-    }#end of while 
-    $buffer = $null
-
-    if ($bufferPos -ge $rangeEnd - $pattern.Length + 1){
-        return -1
-    }else{
-        return  $bufferPos
-    }
-}
-
-function DecryptToBuffer($Mp4Info, $i, $partPos, $buffer, $bufferPos, $Len){    
-    $n = $partPos % 16
-
-    if ($partPos -ge 16){
-        $Mp4Info[$i].fs.Position = $Mp4Info[$i].FSoffset + $partPos - $n - 16
-        $blockIV = New-Object byte[] 16
-        [void]$Mp4Info[$i].fs.read($blockIV, 0, 16)
-
-        $cs = new-object System.Security.Cryptography.CryptoStream (
-            $Mp4Info[$i].fs,
-            $Mp4Info[$i].aes.CreateDecryptor($Mp4Info[$i].aes.key, $blockIV),
-            0
-            )
-        $blockIV = $null
-
-    }else{
-        $Mp4Info[$i].fs.Position = $Mp4Info[$i].FSoffset
-        $cs = new-object System.Security.Cryptography.CryptoStream (
-            $Mp4Info[$i].fs, $Mp4Info[$i].aes.CreateDecryptor(), 0
-            )
-    }
-
-    $blockSkip = new-object byte[] 16
-    [void]$cs.read($blockSkip, 0, $n)
-
-    [void]$cs.read($buffer, $bufferPos, $Len)
-    $cs = $null
-    $blockSkip = $null
-}
-
-
-function overlap($a, $b, $aIsSure, $midPackSize){
-    $searchLen0 = 0
-    $sInfo0 = $null
-    $sIndex0 = $null
-    $sPos0 = $null
-    $sDirection0 = $null
-    $pattern0 = $null
-        
-        $j = 1
-    for ($i = 1; $i -lt $a.count; $i++){
-        if ($a[$i].fs -ne $null -or $null -ne $a[$i].buffer){
-            for (; $j -lt $b.count; $j++){
-                if ($a[$i].Mp4offset -lt $b[$j].Mp4offset ){
-                    break
-                }
-            }
-            $j--
-           
-            if ($b[$j].fs -ne $null -or $null -ne $b[$j].buffer){
-
-                $bPartPos = $a[$i].Mp4offset - $b[$j].Mp4offset
-
-                $aLen = $a[$i].length
-                for ($i2 = $i+1; $i2 -lt $a.count; $i2++){
-                    if ($a[$i2].fs -ne $null -or $null -ne $a[$i2].buffer){ $aLen += $a[$i2].length}else{break}
-                }
-                $bLen = $b[$j].length - $bPartPos
-                for ($j2 = $j+1; $j2 -lt $b.count; $j2++){
-                    if ($b[$j2].fs -ne $null -or $null -ne $b[$j2].buffer){$ $bLen += $b[$j2].length}else{break}
-                }
-
-                if ($aLen -gt 16 -and $bLen -gt 16){
-                    $sameByteLen = 16
-                }elseif ($aLen -gt $bLen){
-                    $sameByteLen = $bLen
-                }else{
-                    $sameByteLen = $aLen
-                }
-
-                $aLenB = $sameByteLen
-                for($i2 = $i-1; $i2 -ge 0; $i2--){
-                    if ($a[$i2].fs -ne $null -or $null -ne $a[$i2].buffer){$aLenB += $a[$i2].length}else{break}
-                }
-
-                $bLenB = $bPartPos + $sameByteLen
-                for($j2 = $j-1; $j2 -ge 0; $j2--){
-                    if ($b[$j2].fs -ne $null -or $null -ne $b[$j2].buffer){$bLenB += $b[$j2].length}else{break}
-                }
-                <#
-                write-host "`$aLen $aLen"
-                write-host "`$aLenB $aLenB"
-                write-host "`$bLen $bLen"
-                write-host "`$bLenB $bLenB"
-                #>
-                #=============================
-
-                
-                [byte[]]$sameByteA = New-Object byte[] $sameByteLen
-                readForward $a  $i  0  $sameByteLen  $sameByteA > $null
-
-                [byte[]]$sameByteB = New-Object byte[] $sameByteLen
-                readForward $b  $j  $bPartPos  $sameByteLen  $sameByteB > $null
-
-                if ("$sameByteA" -eq "$sameByteB"){return 0}
-
-                if ($aIsSure){
-                    if ($aLenB -gt $bLen){
-                        $searchLen = $aLenB
-                        $sInfo = $a
-                        $sIndex = $i
-                        $sPos = $sameByteLen - 1
-                        $sDirection = 'left'
-                        $pattern = $sameByteB
-                    }else{
-                        $searchLen = $bLen
-                        $sInfo = $b
-                        $sIndex = $j
-                        $sPos = $bPartPos
-                        $sDirection = 'right'
-                        $pattern = $sameByteA
+                    }else{ # $startPos -lt 16
+                        $parts[$i].fs.Position = $parts[$i].fsOffset
+                        $blockIV = $parts[$i].iv0
                     }
-                }else{
-                    if ($aLen -gt $bLenB){
-                        $searchLen = $aLen
-                        $sInfo = $a
-                        $sIndex = $i
-                        $sPos = 0
-                        $sDirection = 'right'
-                        $pattern = $sameByteB
-                    }else{
-                        $searchLen = $bLenB
-                        $sInfo = $b
-                        $sIndex = $j
-                        $sPos = $bPartPos + $sameByteLen - 1
-                        $sDirection = 'left'
-                        $pattern = $sameByteA
+    
+                    $cs = new-object System.Security.Cryptography.CryptoStream (
+                        $parts[$i].fs,
+                        $this.Aes.CreateDecryptor($this.Aes.Key, $blockIV),
+                        0
+                        )
+    
+                    if ($n -gt 0){
+                        $blockSkip = new-object byte[] $n
+                        [void]$cs.read($blockSkip, 0, $n)
                     }
-                }
-
-                if ($searchLen -gt $searchLen0){
-                    $searchLen0 = $searchLen
-                    $sInfo0 = $sInfo
-                    $sIndex0 = $sIndex
-                    $sPos0 = $sPos
-                    $sDirection0 = $sDirection
-                    $pattern0 = $pattern
-                }
-                if ($searchLen0 -gt $midPackSize){break}
-            }# end of if
-            
-        }# end of if $a[$i].fs -ne $null
-    }#end of for
-
-    if ($sDirection0 -eq 'right'){
-        $r = BmForward  $sInfo0  $sIndex0  $sPos0  $pattern0  $searchLen0
-        if ($r -ge $searchLen0){return -1}
-    }else{
-        $r = BmBackward  $sInfo0  $sIndex0  $sPos0  $pattern0  $searchLen0
-        if ($r -lt 0){return -1}
-        $r = $searchLen0 - $pattern0.length - $r
-    }
-
-    return $r
-}
-function addPartFromOther($h){
-    # need to search other source ?
-    if ($script:h0 -eq $null){
-        $Mp4Info = $h.Mp4Info
-        $needSearch = $false
-
-        for($i = 0; $i -lt $Mp4Info.count; $i++){
-            if ($Mp4Info[$i].fs -eq $null -and $null -eq $Mp4Info[$i].buffer){ $needSearch = $true; break }
-        }
-        if ( ! $needSearch){
-            if ($Mp4Info[-1].Mp4offset + $Mp4Info[-1].length -lt $h.FullPack){
-                $needSearch = $true
-            }
-        }
-        #================
-        if ($needSearch){
-            $script:h0 = $h
-        
-            for ($i = 0; $i -lt $script:otherGroup.count; $i++){
-                parseRARs  $script:otherGroup[$i]  $script:buffer
-            }
-            $script:h0 = $null
-            return
-        }
     
-    }else{ # $script:h0 -ne $null     (add from other source)
-        if ($script:h0.Mp4Info[0] -eq $null -and $h.Mp4Info[0] -eq $null){return}
-        if ($script:h0.Mp4Info[0] -ne $null -and $h.Mp4Info[0] -ne $null){
-            if ($script:h0.Mp4Info[0].otherSrcList.count -eq 0){
-                $script:h0.Mp4Info[0].otherSrcList = @()
-            }
-            $script:h0.Mp4Info[0].otherSrcList += ,$h.Mp4Info
-            $h.nextPartN = $null
-            return         
-        }
-
-        $unSureIsH0 = $false
-        if ($script:h0.Mp4Info[0] -eq $null){
-            if ($script:h0.FileEncrypt){return}
-            $unSure = $script:h0.Mp4Info
-            $rarVer = $script:h0.rarVer
-            $midPackSize = $script:h0.midPackSize
-            $unSureIsH0 = $true
-
-            $sure = $h.Mp4Info
-        }else{
-            if ($h.FileEncrypt){return}
-            $unSure = $h.Mp4Info
-            $rarVer = $h.rarVer
-            $midPackSize = $h.midPackSize
-
-            $sure = $script:h0.Mp4Info
-        }
-
-        # $unSure guess Mp4offset
-        $BaseName = [IO.Path]::GetFileNameWithoutExtension($unSure[1].fs.name)
-        $shiftSize = $midPackSize * ( -1 + $( $BaseName -replace '.*part','' ))
-        if ($rarVer -eq 5){ $shiftSize += 1 }
-            
-        for ($i = 1; $i -lt $unSure.count; $i++){
-            $unSure[$i].Mp4offset += $shiftSize
-        }
-        $unSure[0] = @{ fs = $null; length = $shiftSize; Mp4offset = 0 
-                Mp4Name = $unSure[1].Mp4Name; Mp4Size = $unSure[1].Mp4Size
-                Mp4FullName = $Mp4Info[1].Mp4FullName}
-
-        
-        $Mp4offset = $unSure[-1].Mp4offset + $unSure[-1].length
-        $nEmpty = $unSure[0].Mp4Size - $Mp4offset 
-        if ($nEmpty){
-            [void]$unSure.add( @{fs = $null; Mp4offset = $Mp4offset; length = $nEmpty}  )
-        }
-        
-
-        $r = overlap  $unSure $sure $false $midPackSize
-        if ($r -lt 0){ $r = overlap  $sure $unSure $true $midPackSize }
-
-        if ($r -lt 0){
-            $h.Mp4Info | %{
-                if ($_.fs -ne $null) {$_.fs.close()}
-            }
-            $h.nextPartN = $null
-
-            if ($unSureIsH0){
-                for ($i = 1; $i -lt $unSure.count; $i++){
-                    $unSure[$i].Mp4offset -= $shiftSize
-                }
-                $unSure[0] = $null
-                if ($unSure[-1].fs -eq $null){
-                    $unSure.RemoveAt($unSure.count - 1)
+                    [void]$cs.read($buffer, $bufferPos, $readSize)
+                    $cs = $null
+                    $blockSkip = $null
                 }
             }
-            return
+
+            $Len1 -= $readSize
+            $bufferPos += $readSize
+            $i++
+            $partPos = 0
+            $partLen = $parts[$i].Len
         }
 
-        if ($r -gt 0){
-            for ($i = 1; $i -lt $unSure.count; $i++){
-                $unSure[$i].Mp4offset -= $r
-            }
-            $unSure[0].length = $shiftSize - $r
-            $unSure[-1].length += $r
-
-            if ($unSure[1].aes -ne $null){
-                adjustRange  $unSure
-            }
-        }
-        # if ($r -eq 0) no need edit
-
-        if ($script:h0.Mp4Info[0].otherSrcList.count -eq 0){
-            $script:h0.Mp4Info[0].otherSrcList = @()
-        }
-
-        $script:h0.Mp4Info[0].otherSrcList += ,$h.Mp4Info
-        $h.nextPartN = $null
+        return $Len
     }
-
-}
-function mp4Ending($h){
-    if ($h.nextPartN -eq $null){return}
-
-    $Mp4Info = $h.Mp4Info
-
-    if ($Mp4Info[0] -ne $null){
-        if ($Mp4Info[-1].Mp4offset + $Mp4Info[-1].length -lt $Mp4Info[0].Mp4Size){
-            $Mp4offset = $Mp4Info[-1].Mp4offset + $Mp4Info[-1].length
-            $nEmpty = $Mp4Info[0].Mp4Size - $Mp4offset
-            [void]$Mp4Info.add( @{fs = $null; Mp4offset = $Mp4offset; length = $nEmpty}  )
-
-            if ($h.FileEncrypt){ adjustRange $Mp4Info }
-        }
-    }
-
-    if ($script:searchOtherSrc){
-        addPartFromOther $h
-        if ($script:h0 -ne $null){ return }
-    }
-
-    #=========================================
-    
-    if ($Mp4Info[0].fs -eq $null -and $null -eq $Mp4Info[0].otherSrcList){
-        $r = $false
-        if ($h.Mp4FullName_now -match '\.mp4$'){
-            
-            $r = rebuildMp4 $Mp4Info
-        }
-        if ( !$r ){ #rebuild fail
-            $Mp4Info | %{
-                if ($_.fs -ne $null) {$_.fs.close()}
-            }
-            $h.nextPartN = $null
-            return
-        }
-
-    }
-    
-    $script:Mp4NameList += $Mp4Info[0].Mp4Name
-    $script:Mp4InfoList += ,$Mp4Info
-    
-    $h.nextPartN = $null
 }
 
-function parseRARs($rarFiles, $buffer){
-    if ($null -eq $rarFiles){return}
-    
-    $h = @{
-        Mp4Info = $null; nextPartN = $null
-        Mp4FullName_now = $null; Mp4Size_now = $null
-        FullPack = $null; midPackSize = $null; nEmpty = $null
-        FileEncrypt = $null; HeadEncrypt = $null; aes_obj = $null
-        rarVer = $null; fsForType0 = $null
-        comment = $null
+class NameLink{
+    [string]$endName = ''
+    [File]$file = $null
+
+    NameLink([string]$inEndName, [File]$inFile){
+        $this.endName = $inEndName
+        $this.file = $inFile
     }
-
-    $rarFiles | %{
-        trap{$fs.close(); write-host $_.Exception; pause; return}
-        
-        $fs = $_.OpenRead()
-        #=============check RAR signature============
-        $n = $fs.read($buffer , 0 , 8)
-        if ($n -lt 8) {throw "$_ file is too small"}
-    
-        if ( [BitConverter]::ToString($buffer,0,7) -eq '52-61-72-21-1A-07-00'){
-            # RAR4
-            $fs.Position = 7
-            $h.rarVer = 4
-            $getHeader = $script:getHeader4
-            
-        }elseif ( [BitConverter]::ToString($buffer,0,8) -eq '52-61-72-21-1A-07-01-00'){
-            # RAR5
-            $h.rarVer = 5
-            $getHeader = $script:getHeader5
-        } else {
-            $fs.close(); Write-Host "$_ is not RAR";return
-        }
-
-        #=============read main header===============
-        beforeFileHeader $getHeader $h  $fs  $buffer  $_
-        
-        $h.fsForType0 = $null
-        while ($fs.Position -lt $fs.length ){
-
-            #==============read file header==============
-            $PackType, $PackOffset, $PackSize =  parseFileHeader $getHeader $h $fs  $buffer  $_
-            
-            if ($PackType -eq 1 -or $PackType -eq 0){
-
-                if ($h.nextPartN){mp4Ending  $h}
-            }
-
-            #===Is this block  the last block need to be processed in this file ? ===
-            switch -w  ($PackType) {
-                #First pack  or Middle pack
-                #After this block , no content in this  file need to be processed
-                [23]{ $fs.close(); return }
-    
-                [019]{ # normal pack  or last pack or $HeadTypeName -ne 'File'
-                    if ($PackOffset + $PackSize -gt $fs.length) {
-                        $fs.close(); return
-                    }else{
-                        $fs.Position = $PackOffset + $PackSize
-                    }
-                }
-            } # end of switch
-        }#end of while
-    
-        $fs.close()
-    }
-    
-    if ($h.nextPartN -ne $null) {mp4Ending $h}
 }
+
+class ListRef{
+    [int]$position = 0
+}
+
+class OpenRef{
+    [long]$openSequence = 0
+    [File]$file = $null
+    [System.Collections.Generic.SortedDictionary[long,Object]]$listRefs = $null
+
+    OpenRef([File]$inFile){
+        $this.file = $inFile;
+        $this.listRefs = [System.Collections.Generic.SortedDictionary[long,Object]]::new()
+    }
+}
+
 
 $RarVolumeType = @'
 #Learn from   Pismo File Mount Development Kit   samples\tempfs_cs\tempfs.cs
 class RarVolume: Pfm+FormatterDispatch{
-    $fileIds = @{}
-    $openRefs = @{}
-    $root = $null
-
+    [Pfm+Marshaller]$marshaller = $null
     [long]$lastFileId = 0
     [long]$lastOpenSequence = 0
 
-RarVolume($folders, $dataSrc){
-    $this.root = $this.MakeFile([Pfm]::fileTypeFolder, 0, 0)
+    [System.Collections.Generic.SortedDictionary[long,Object]]$openRefs = $null
+    [System.Collections.Generic.SortedDictionary[long,Object]]$fileIds = $null
+    [File]$root = $null
+
+
+
+RarVolume([string]$rarPath){
+    $this.lastFileId = 1
+    $this.lastOpenSequence = 0
+    $this.openRefs = [System.Collections.Generic.SortedDictionary[long,Object]]::new()
+    $this.fileIds = [System.Collections.Generic.SortedDictionary[long,Object]]::new()
+
+    $this.root = [File]::new([Pfm]::fileTypeFolder, 0, 0)
     $this.root.nameCount = 1
     $this.root.fileId = 1
-    $this.lastFileId = 1
-    $this.fileIds.($this.root.fileId) = $this.root
+    $this.fileIds[$this.root.fileId] = $this.root
 
-
-    $keys = @()
-    foreach($key in $folders.Keys){
-        $keys += $key
-    }
-
-    foreach($key in $keys){
-        $arrFolderPart = $key.Split(('\','/'),[StringSplitOptions]1)
-        $r = $this.MakeFolder($folders, $key, $arrFolderPart)
-        
-    }
-
-
-    for ($i = 0; $i -lt $dataSrc.count; $i++){
-        $file = $this.MakeFile([Pfm]::fileTypeFile, 0, 0)
-        $file.fileSize = $dataSrc[$i][0].Mp4Size
-        $file.data = $dataSrc[$i]
-
-        $fileName = $dataSrc[$i][0].Mp4Name
-
-        if ($null -eq $dataSrc[$i][0].FolderPath){
-            $r = $this.AddToFolder($this.root, $fileName, $file)
-        }else{
-            $arrFolderPath = $dataSrc[$i][0].FolderPath
-            foreach ($FolderPath in $arrFolderPath){
-                $FolderPath = $FolderPath -replace '/','\'
-                if ($null -ne $folders.$FolderPath){
-                    $r = $this.AddToFolder($folders.$FolderPath, $fileName, $file)
-                }
-            }    
-        }
-    }# end of for
+    $rar = [RAR]::new($rarPath)
+    $this.makeFromRAR($rar.entries, $rar.FsTable)
 }
 
-[void] Dispose(){}
+[void]makeFromRAR([rarEntry[]]$entries, [hashtable]$FsTable){
 
-[PSCustomObject]MakeFile($FileType, $FileFlags, $WriteTime){
-    $file = [PSCustomObject] @{
-        nameCount = 0; fileType = $FileType; fileFlags = $FileFlags; openId = 0; fileId = 0;
-        createTime = $WriteTime; accessTime = $WriteTime; writeTime = $WriteTime; changeTime = $WriteTime;
-        fileSize = 0; data = $null; children = $null
+    for ($i = 0; $i -lt $entries.Count; $i++){
+        $entry = $entries[$i]
+
+        if ($entry.IsCompress){continue}
+
+        $arrName = @($entry.FullName -split '[/\\]')
+        $parent = $null
+        $file = $null
+        $endName = $null
+
+        $perr = $this.FileFindName($arrName, [ref]$parent, [ref]$file, [ref]$endName)
+
+        if ($perr -eq 0 -or $perr -eq [Pfm]::ErrorInvalid){continue}
+
+        if ($entry.IsDir){ # entry is folder
+            $this.makeFolder($entry.FullName) > $null
+            continue
+        }
+
+        # $entry is file
+        $folderPath = Split-Path $entry.FullName
+        $parent = $this.makeFolder($folderPath)
+
+        if ($parent-eq $null){continue}
+        $file = [File]::makeFile($entries, $i, $FsTable)
+        if ($file -eq $null){continue}
+
+        $endName = $entry.Name
+        $this.FileNameAdd($parent, 0, $endName, $file)
     }
-    if ($FileType -eq [Pfm]::fileTypeFolder){
-        $file.children = New-Object System.Collections.SortedList
+}
+
+[File]makeFolder([string]$FolderPath){
+    if ($FolderPath -eq ''){return $this.Root}
+
+    [string[]]$arrName = @($FolderPath -split '[/\\]')
+    $parent = $null
+    $file = $null
+    $endName = $null
+
+    $perr = $this.FileFindName($arrName, [ref]$parent, [ref]$file, [ref]$endName)
+
+    if ($perr -eq 0){
+        return $file
+    }elseif ($perr -eq [Pfm]::ErrorInvalid){
+        return $null
     }
+
+    if ($perr -eq [Pfm]::errorParentNotFound){
+        $parentFolderPath = Split-Path $folderPath
+        $parent = $this.makeFolder($parentFolderPath)
+        if ($parent -eq $null){return $null}
+    }
+
+    $file = [File]::new([Pfm]::fileTypeFolder, 0, 0)
+    $endName = Split-Path $folderPath -Leaf
+    $this.FileNameAdd($parent, 0, $endName, $file)
+
     return $file
 }
-[int]MakeFolder($folders, $key, [string[]]$folderPart){
-    $parent = $null
-    $file = $this.root
-    $i = 0
 
-    while ($i -lt $FolderPart.length){
-        $parent = $file
-        $file = $null
-        $endName = $FolderPart[$i++]
-        $foldedName = $endName.ToLower()
-        $nameLink = $parent.children[ $foldedName]
-
-        if ($null -eq $nameLink){
-            $file = $this.MakeFile([Pfm]::fileTypeFolder, 0, 0)
-            $this.FileNameAdd($parent, 0, $endName, $file)
-
-        }else{
-            $file = $nameLink.file
-            if ($file.fileType -ne [Pfm]::fileTypeFolder){
-                write-host "can't make folder: $($FolderPart -join '\')"
-                return 1
-            }
-        }
-    }#end of while
-
-    $folders.$key = $file
-    return 0
-}
-[int]AddToFolder($parent, [string]$fileName, $file){
-    $endName = $fileName
-    $foldedName = $endName.ToLower()
-    $nameLink = $parent.children[ $foldedName]
-
-    if ($null -eq $nameLink){
-        $this.FileNameAdd($parent, 0, $endName, $file)
-    }else{
-        write-host "can't addToFolder`n $endName already exist"
-        return 1
-    }
-
-    return 0
-}
-
-[void] FileOpened( $file, $openAttribs){
-    $openRef = $this.openRefs.($file.openId)
+[void] FileOpened([File]$file, [Pfm+OpenAttribs]$openAttribs){
+    $openRef = $this.openRefs[$file.openId]
 
     if ($null -eq $openRef){
-        $openRef = [PSCustomObject]@{openSequence = 0; file = $file; listRefs = @{}}
-        $this.openRefs.($file.openId) = $openRef
+        $openRef = [OpenRef]::new($file)
+        $this.openRefs[$file.openId] = $openRef
     }
 
     $openRef.openSequence = ++ $this.lastOpenSequence
@@ -2149,7 +1743,7 @@ RarVolume($folders, $dataSrc){
 [int] FileFindOpenId([long]$openId, [ref]$file){
     $perr = [Pfm]::errorInvalid
     $file.Value = $null
-    $openRef = $this.openRefs.$openId
+    $openRef = $this.openRefs[$openId]
     if ($null -ne $openRef){
         $file.Value = $openRef.file
         $perr = 0
@@ -2159,7 +1753,7 @@ RarVolume($folders, $dataSrc){
 
 [int] FileFindFileId([long]$fileId, [ref]$file){
     $perr = [Pfm]::errorNotFound
-    $file.Value = $this.fileIds.$fileId
+    $file.Value = $this.fileIds[$fileId]
     if ($null -ne $file.Value){ $perr = 0 }
 
     return $perr
@@ -2172,7 +1766,7 @@ RarVolume($folders, $dataSrc){
     $endName.Value = ""
     $i = 0
 
-    while ($i -lt $nameParts.Length){
+    while ($perr -eq 0 -and $i -lt $nameParts.Count){
         $parent.Value = $file.Value
         $file.Value = $null
 
@@ -2183,11 +1777,11 @@ RarVolume($folders, $dataSrc){
 
         $endName.Value = $nameParts[$i++]
         $foldedName = $endName.Value.ToLower()
-        $nameLink = $parent.Value.children[ $foldedName]
+        $nameLink = $parent.Value.children[$foldedName]
 
         if ($null -eq $nameLink){
             $perr = [Pfm]::errorNotFound
-            if ($i -ne $nameParts.Length){
+            if ($i -ne $nameParts.Count){
                 $parent.Value = $null
                 $endName.Value = $null
                 $perr = [Pfm]::errorParentNotFound
@@ -2206,12 +1800,13 @@ RarVolume($folders, $dataSrc){
 
 [void] FileNameAdd($parent, $writeTime, $endName, $file){
     if ($file.fileId -eq 0){ $file.fileId = ++$this.lastFileId }
+    $nameLink = [NameLink]::new($endName, $file)
     $foldedName = $endName.ToLower()
-    $parent.children[ $foldedName] = [PSCustomObject]@{ endName = $endName; file = $file}
+    $parent.children[$foldedName] = $nameLink
     $parent.writeTime = $writeTime
     $parent.changeTime = $writeTime
     $file.nameCount ++
-    $this.fileIds.($file.fileId) = $file
+    $this.fileIds[$file.fileId] = $file
 }
 
 [int] FileNameRemove($parent, $writeTime, $endName, $file){
@@ -2220,18 +1815,18 @@ RarVolume($folders, $dataSrc){
     $nameLink = $parent.children[$foldedName]
     if ($null -ne $nameLink -and $nameLink.file -eq $file){
         $perr = 0
-        $parent.children.Remove( $foldedName)
+        $parent.children.Remove($foldedName)
         $parent.writeTime = $writeTime
         $parent.changeTime = $writeTime
         $file.nameCount--
         if ($file.nameCount -eq 0){
-            $this.fileIds.Remove( $file.fileId)
+            $this.fileIds.Remove($file.fileId)
         }
     }
     return $perr
 }
 
-[void] Open( [Pfm+MarshallerOpenOp]$op){
+[void] Open([Pfm+MarshallerOpenOp]$op){
     $nameParts = $op.NameParts()
     $createFileType = $op.CreateFileType()
     $createFileFlags = $op.CreateFileFlags()
@@ -2241,7 +1836,7 @@ RarVolume($folders, $dataSrc){
     
     $perr = 0
     $existed = $false
-    $openAttribs =  new-object Pfm+OpenAttribs
+    $openAttribs = [Pfm+OpenAttribs]::new()
     $parentFileId = 0
     $endName = $null
 
@@ -2256,20 +1851,13 @@ RarVolume($folders, $dataSrc){
         if ($file.openId -eq 0){ $file.openId = $newExistingOpenId }
         $this.FileOpened($file, $openAttribs)
     
-    }elseif($perr -eq [Pfm]::errorNotFound -and $createFileType -ne [Pfm]::fileTypeNone){
-        $file = $this.MakeFile($createFileType, $createFileFlags, $writeTime)
-
-        $this.FileNameAdd($parent, $writeTime, $endName, $file)
-        $file.openId = $newCreateOpenId
-        $this.FileOpened($file, $openAttribs)
-        $parentFileId = $parent.fileId
-        $perr = 0
     }
+    
     $op.Complete($perr, $existed, $openAttribs, $parentFileId, $endName, 0, $null, 0, $null)
 
 }
 
-[void] Replace( [Pfm+MarshallerReplaceOp]$op){
+[void] Replace([Pfm+MarshallerReplaceOp]$op){
     $targetOpenId = $op.TargetOpenId()
     $targetParentFileId = $op.TargetParentFileId()
     $targetEndName = $op.TargetEndName()
@@ -2277,7 +1865,7 @@ RarVolume($folders, $dataSrc){
     $writeTime = $op.WriteTime()
     $newCreateOpenId = $op.NewCreateOpenId()
     $perr = 0
-    $openAttribs =  new-object Pfm+OpenAttribs
+    $openAttribs = [Pfm+OpenAttribs]::new()
     $targetFile = $null
     $parent = $null
     $file = $null
@@ -2299,7 +1887,7 @@ RarVolume($folders, $dataSrc){
 
 }
 
-[void] Move( [Pfm+MarshallerMoveOp] $op){
+[void] Move([Pfm+MarshallerMoveOp] $op){
     $sourceOpenId = $op.SourceOpenId()
     $sourceParentFileId = $op.SourceParentFileId()
     $sourceEndName = $op.SourceEndName()
@@ -2309,7 +1897,7 @@ RarVolume($folders, $dataSrc){
     $newExistingOpenId = $op.NewExistingOpenId()
     $perr = 0
     $existed = $false
-    $openAttribs =  new-object Pfm+OpenAttribs
+    $openAttribs = [Pfm+OpenAttribs]::new()
     $parentFileId = 0
     $endName = $null
     $sourceFile = $null
@@ -2338,7 +1926,7 @@ RarVolume($folders, $dataSrc){
     $op.Complete($perr, $existed, $openAttribs, $parentFileId, $endName, 0, $null, 0, $null)
 }
 
-[void] MoveReplace( [Pfm+MarshallerMoveReplaceOp] $op){
+[void] MoveReplace([Pfm+MarshallerMoveReplaceOp] $op){
     $sourceOpenId = $op.SourceOpenId()
     $sourceParentFileId = $op.SourceParentFileId()
     $sourceEndName = $op.SourceEndName()
@@ -2364,7 +1952,7 @@ RarVolume($folders, $dataSrc){
     $op.Complete( $perr)
 }
 
-[void] Delete( [Pfm+MarshallerDeleteOp] $op){
+[void] Delete([Pfm+MarshallerDeleteOp] $op){
     $openId = $op.OpenId()
     $parentFileId = $op.ParentFileId()
     $endName = $op.EndName()
@@ -2381,15 +1969,13 @@ RarVolume($folders, $dataSrc){
     $op.Complete( $perr)
 }
 
-[void] Close( [Pfm+MarshallerCloseOp] $op){
-    $op.Complete( [Pfm]::errorSuccess)
-<#
+[void] Close([Pfm+MarshallerCloseOp] $op){
     $openId = $op.OpenId()
     $openSequence = $op.OpenSequence()
     $perr = 0
     $openRef = $null
 
-    $openRef = $this.openRefs.$openId
+    $openRef = $this.openRefs[$openId]
     if ($null -eq $openRef){
         $perr = [Pfm]::errorInvalid
     }else{
@@ -2399,10 +1985,10 @@ RarVolume($folders, $dataSrc){
     }
    
     $op.Complete( $perr)
-#> 
+
 }
 
-[void] FlushFile( [Pfm+MarshallerFlushFileOp] $op){
+[void] FlushFile([Pfm+MarshallerFlushFileOp] $op){
     $openId = $op.OpenId()
     $flushFlags = $op.FlushFlags()
     $fileFlags = $op.FileFlags()
@@ -2411,7 +1997,7 @@ RarVolume($folders, $dataSrc){
     $writeTime = $op.WriteTime()
     $changeTime = $op.ChangeTime()
     $perr = 0
-    $openAttribs = new-object Pfm+OpenAttribs
+    $openAttribs = [Pfm+OpenAttribs]::new()
     $file = $null
 
     $perr = $this.FileFindOpenId($openId, [ref]$file)
@@ -2435,24 +2021,29 @@ RarVolume($folders, $dataSrc){
             $this.FileOpened($file, $openAttribs)
         }
     }
-    $op.Complete( $perr, $openAttribs, $null)
+    $op.Complete($perr, $openAttribs, $null)
 }
 
-[void] List( [Pfm+MarshallerListOp] $op){
+[void] List([Pfm+MarshallerListOp] $op){
     $openId = $op.OpenId()
     $listId = $op.ListId()
     $perr = 0
     $noMore = $true
-    $Attribs = new-object Pfm+Attribs
+    $children = $null
+    $Attribs = [Pfm+Attribs]::new()
+    $openRef = $null
+    $listRef = $null
+    $nameLink = $null
+    $file = $null
 
-    $openRef = $this.openRefs.$openId
+    $openRef = $this.openRefs[$openId]
     if ($null -eq $openRef){
         $perr = [Pfm]::errorInvalid
     }else{
-        $listRef = $openRef.listRefs.$listId
+        $listRef = $openRef.listRefs[$listId]
         if ($null -eq $listRef){
-            $listRef = @{position = 0}
-            $openRef.listRefs.$listId =  $listRef
+            $listRef = [ListRef]::new()
+            $openRef.listRefs[$listId] =  $listRef
         }
         $children = $openRef.file.children
 
@@ -2470,7 +2061,7 @@ RarVolume($folders, $dataSrc){
                 $attribs.changeTime = $file.changeTime
                 $attribs.fileSize = $file.fileSize
 
-                if ($op.Add( $attribs, $nameLink.endName)){
+                if ($op.Add($attribs, $nameLink.endName)){
                     $listRef.position ++
                     continue
                 }
@@ -2478,116 +2069,22 @@ RarVolume($folders, $dataSrc){
             break
         }
     }
-    $op.Complete( $perr, $noMore)
+    $op.Complete($perr, $noMore)
 }
 
-[void] ListEnd( [Pfm+MarshallerListEndOp] $op){
+[void] ListEnd([Pfm+MarshallerListEndOp] $op){
     $openId = $op.OpenId()
     $listId = $op.ListId()
     $perr = 0
     $openRef = $null
 
-    $openRef = $this.openRefs.$openId
+    $openRef = $this.openRefs[$openId]
     if ($null -eq $openRef){
         $perr = [Pfm]::errorInvalid
     }else{
-        $openRef.listRefs.Remove( $listId)
+        $openRef.listRefs.Remove($listId)
     }
     $op.Complete( $perr)
-}
-
-[void]FileRead($Mp4Info, $currentMp4offset, $data, $dataPos, $actualSize){ 
-    for ( $j = 1 ; $j -lt $Mp4Info.count ; $j++ ){
-        if ($currentMp4offset  -lt $Mp4Info[$j].Mp4offset ){break}
-    }					
-    $j--
-
-    $actualSize1 = $actualSize
-
-    while ($actualSize1 -gt 0){
-        $partPos = $currentMp4offset - $Mp4Info[$j].Mp4offset
-        $partLen = $Mp4Info[$j].length - $partPos
-
-        if ($actualSize1 -gt $partLen ){
-            $readSize = $partLen
-        }else{
-            $readSize = $actualSize1
-        }
-
-        if ($Mp4Info[$j].srcPath -ne $null){
-            $Mp4Info[$j].fs = New-Object System.IO.FileStream (
-                $Mp4Info[$j].srcPath,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read
-            )
-        }
-
-        if ($Mp4Info[$j].fs -ne $null ){ # fs or cs
-            if ($Mp4Info[$j].aes -eq $null){ # fs
-                $Mp4Info[$j].fs.Position = $Mp4Info[$j].FSoffset + $partPos
-                [void]$Mp4Info[$j].fs.read($data , $dataPos, $readSize)
-            }else{ # cs
-                $n = $partPos % 16
-
-                if ($partPos -ge 16){
-
-                    $Mp4Info[$j].fs.Position = $Mp4Info[$j].FSoffset + $partPos - $n - 16
-                    $blockIV = New-Object byte[] 16
-                    [void]$Mp4Info[$j].fs.read($blockIV, 0, 16)
-
-                    $cs = new-object System.Security.Cryptography.CryptoStream (
-                        $Mp4Info[$j].fs,
-                        $Mp4Info[$j].aes.CreateDecryptor($Mp4Info[$j].aes.key, $blockIV),
-                        0
-                        )
-                    $blockIV = $null
-
-                }else{
-                    $Mp4Info[$j].fs.Position = $Mp4Info[$j].FSoffset
-                    $cs = new-object System.Security.Cryptography.CryptoStream (
-                        $Mp4Info[$j].fs, $Mp4Info[$j].aes.CreateDecryptor(), 0
-                        )
-                }
-
-                $blockSkip = new-object byte[] 16
-                [void]$cs.read($blockSkip, 0, $n)
-
-                [void]$cs.read($data, $dataPos, $readSize )
-                $cs = $null
-                $blockSkip = $null
-            }
-        }else{ # fs  $null
-            if ($Mp4Info[$j].buffer.count -ne 0){
-                [array]::Copy($Mp4Info[$j].buffer, $partPos, $data, $dataPos, $readSize)
-            }else{
-                [array]::Clear($data, $dataPos, $readSize)
-
-                if ($Mp4Info[0].otherSrcList.count -ne 0){
-                    foreach ($Mp4Info2 in $Mp4Info[0].otherSrcList){
-                        $this.read2($Mp4Info2, $currentMp4offset, $data, $dataPos, $readSize)
-                        
-                    }
-                }
-            }
-            
-        }
-        $partPos = 0
-
-        if ($Mp4Info[$j].srcPath -ne $null){
-            $Mp4Info[$j].fs.close()
-            $Mp4Info[$j].fs = $null
-        }
-
-        if ($actualSize1 -gt $partLen ){
-            $actualSize1 -= $partLen
-            $dataPos += $partLen
-            $currentMp4offset += $partLen 
-            $j++
-            $partLen = $Mp4Info[$j].length
-        }else{
-            $actualSize1 = 0
-        }
-    }# end of while
 }
 
 [void] Read( [Pfm+MarshallerReadOp] $op){
@@ -2601,221 +2098,78 @@ RarVolume($folders, $dataSrc){
 
     $perr = $this.FileFindOpenId($openId, [ref]$file)
     if ($perr -eq 0){
-        if ($fileOffset -lt $file.fileSize){
-            $actualSize = $requestedSize
-            if ($fileOffset + $actualSize -gt $file.fileSize){
-                $actualSize = $file.fileSize - $fileOffset
-            }
-        }
-        if ($actualSize -ne 0){
-            $this.FileRead($file.data, $fileOffset, $data, 0, $actualSize)
-        }
+        $actualSize = $file.Read($data, $fileOffset, $requestedSize)
     }
-    $op.Complete( $perr, $actualSize)
+    $op.Complete($perr, $actualSize)
 }
 
 
-[void] Write( [Pfm+MarshallerWriteOp] $op){
-    $op.Complete( [Pfm]::errorAccessDenied, 0)
+[void] Write([Pfm+MarshallerWriteOp] $op){
+    $op.Complete([Pfm]::errorAccessDenied, 0)
 }
 
-[void] SetSize( [Pfm+MarshallerSetSizeOp] $op){
-    $op.Complete( [Pfm]::errorAccessDenied)
+[void] SetSize([Pfm+MarshallerSetSizeOp] $op){
+    $op.Complete([Pfm]::errorAccessDenied)
 }
 
-[void] Capacity( [Pfm+MarshallerCapacityOp] $op){
-    $op.Complete( [Pfm]::errorSuccess, 10TB, 9TB)
+[void] Capacity([Pfm+MarshallerCapacityOp] $op){
+    $op.Complete([Pfm]::errorSuccess, 10TB, 9TB)
 }
 
-[void] FlushMedia( [Pfm+MarshallerFlushMediaOp] $op){
-    $op.Complete( [Pfm]::errorSuccess, -1)
+[void] FlushMedia([Pfm+MarshallerFlushMediaOp] $op){
+    $op.Complete([Pfm]::errorSuccess, -1)
 }
 
-[void] Control( [Pfm+MarshallerControlOp] $op){
-    $op.Complete( [Pfm]::errorInvalid, 0)
+[void] Control([Pfm+MarshallerControlOp] $op){
+    $op.Complete([Pfm]::errorInvalid, 0)
 }
 
-[void] MediaInfo( [Pfm+MarshallerMediaInfoOp] $op){
-    $mediaInfo = new-object Pfm+MediaInfo
-    $op.Complete( [Pfm]::errorSuccess, $mediaInfo, "RarMp4")
+[void] MediaInfo([Pfm+MarshallerMediaInfoOp] $op){
+    $mediaInfo = [Pfm+MediaInfo]::new()
+    $op.Complete([Pfm]::errorSuccess, $mediaInfo, "RarMp4")
 }
 
-[void] Access( [Pfm+MarshallerAccessOp] $op){
+[void] Access([Pfm+MarshallerAccessOp] $op){
     $openId = $op.OpenId()
     $perr = 0
-    $openAttribs = new-object Pfm+OpenAttribs
+    $openAttribs = [Pfm+OpenAttribs]::new()
     $file = $null
 
     $perr = $this.FileFindOpenId($openId, [ref]$file)
     if ($perr -eq 0){ $this.FileOpened($file, $openAttribs) }
-    $op.Complete( $perr, $openAttribs, $null)
+    $op.Complete($perr, $openAttribs, $null)
 }
 
-[void] ReadXattr( [Pfm+MarshallerReadXattrOp] $op){
-    $op.Complete( [Pfm]::errorNotFound, 0, 0)
+[void] ReadXattr([Pfm+MarshallerReadXattrOp] $op){
+    $op.Complete([Pfm]::errorNotFound, 0, 0)
 }
 
-[void] WriteXattr( [Pfm+MarshallerWriteXattrOp] $op){
-    $op.Complete( [Pfm]::errorAccessDenied, 0)
+[void] WriteXattr([Pfm+MarshallerWriteXattrOp] $op){
+    $op.Complete([Pfm]::errorAccessDenied, 0)
 }
 
 
 }
 '@
 
-function startMount($autoOpen, $driveLetter, $MoutName, $Mp4Folders, $Mp4InfoList){
-    #ReadOnly (0x00000001)  UnmountOnRelease (0x00020000)
-    #WorldWrite (0x00000008)
-    $mountFlags = 0x20001
-    if ($autoOpen){$mountFlags = 0x20001 -bor 0x10000}
-    $mcp = new-object Pfm+MountCreateParams -prop @{
-        mountFlags = $mountFlags
-        driveLetter = $driveLetter
-        mountSourceName = $MoutName  }
+#if starting ps1 by right click ps1
+if ($MyInvocation.Line -match '^if\(\(Get-ExecutionPolicy'){ cd -literal $PSScriptRoot }
 
-    $msp = new-object Pfm+MarshallerServeParams  -prop @{
-        volumeFlags = 1
-        dispatch = new-object RarVolume  -arg ($Mp4Folders, $Mp4InfoList )
-        formatterName = "RarMp4Fs"  }
-
-
-    $n1 = $n2 = -1
-    $err = [Pfm]::SystemCreatePipe( [ref] $n1, [ref]$n2 )
-    $msp.toFormatterRead = $n1
-    $mcp.toFormatterWrite = $n2
-        
-
-    $n1 = $n2 = -1
-    $err = [Pfm]::SystemCreatePipe( [ref] $n1, [ref]$n2 )
-    $mcp.fromFormatterRead = $n1
-    $msp.fromFormatterWrite = $n2        
-
-
-
-    $pfmApi = $null 
-    $err = [Pfm]::ApiFactory( [ref] $pfmApi)
-    if($err -ne 0){  Write-Host "ERROR: $err Unable to open PFM API.`n" ; pause ; exit }
-
-    $mount = $null
-    $err = $pfmApi.MountCreate( $mcp, [ref] $mount)
-    if ($err -ne 0){ Write-Host "ERROR: $err Unable to create mount.`n"  }
-
-
-    [Pfm]::SystemCloseFd( $mcp.toFormatterWrite)
-    [Pfm]::SystemCloseFd( $mcp.fromFormatterRead)
-
-
-
-    $marshaller = $null
-    $err = [Pfm]::MarshallerFactory( [ref]$marshaller )
-    if($err -ne 0){  Write-Host "ERROR: $err Unable to create marshaller.`n" ; pause ; exit }
-
-    $marshaller.ServeDispatch( $msp)
-
-
-    [Pfm]::SystemCloseFd( $msp.toFormatterRead)
-    [Pfm]::SystemCloseFd( $msp.fromFormatterWrite)
-
-
-    $pfmApi.Dispose()
-    $mount.Dispose()
-    $marshaller.Dispose()
-}
-function mountFilesNearRAR($rarDir){
-    cd -literal $rarDir
-
-    dir -file |?{$_.length -lt 1MB}|%{
-        $name = $_.Name
-        $n = 1
-        while ($script:Mp4NameList -contains $name){
-            $name = $_.BaseName + '-' + $n + $_.Extension
-            $n++
-        }
-        [System.Collections.ArrayList]$Info = @()
-        [void]$Info.add(@{srcPath = $_.FullName; Mp4offset = 0; length = $_.Length
-            Mp4Name = $name; Mp4Size = $_.Length; parents = @('aaa')
-        })
-        $script:Mp4InfoList += ,$Info
-        $script:Mp4NameList += $name
+if ($rarPath -ne ''){
+    if (!(Test-Path -literal $rarPath -PathType Leaf)){
+        $rarPath = ''
     }
 }
-function loadData($dataPath){
-    [object[]]$arr1 = ConvertFrom-Json ((gc -literal $dataPath) -join "`n")
-    $fs0 = $null
 
-    foreach($arr2 in $arr1){
-        foreach($o in $arr2){
-            if ($null -ne $o.buffer){$o.buffer = [byte[]]$o.buffer}
-            if ($o.aes -ne $null){
-                $key = [byte[]]($o.aes.Key -split ' ')
-                $iv = [byte[]]($o.aes.IV -split ' ')
-                $o.aes = New-Object System.Security.Cryptography.AesCryptoServiceProvider
-                $o.aes.key = $key
-                $o.aes.iv = $iv
-                $o.aes.Padding = 1
-            }
-            if ($o.fs -ne $null){
-                if ($arr2.count -eq 1){
-                    if ($fs0.name -eq $o.fs.name){
-                        $o.fs = $fs0
-                    }else{
-                        $o.fs = New-Object System.IO.FileStream (
-                            $o.fs.name, [IO.FileMode]::Open, [IO.FileAccess]::Read
-                        )
-                        $fs0 = $o.fs
-                    }
-                    
-                }else{
-                    $o.fs = New-Object System.IO.FileStream (
-                        $o.fs.name, [IO.FileMode]::Open, [IO.FileAccess]::Read
-                    )
-                }
-            }
-        }
-        if ($arr2.count -eq 1 -and $arr2[0].fs -ne $null){
-            if ($fs0 -eq $null){
-                $fs0 = $arr2[0].fs
-            }
-        }
+if ($rarPath -eq ''){
+    $files = @(dir *.rar -file)
+    if ($files.Count -gt 0){
+        $rarPath = $files[0].FullName
+    }else{
+        Write-Host 'rar not found'
     }
-    $script:Mp4InfoList = $arr1
 }
-function saveData($Mp4InfoList, $rarDir) {
-    pushd $rarDir
-    $data = ConvertTo-Json $Mp4InfoList -Depth 3
-    sc -Path MountData.txt -Value $data  -enc UTF8
-    popd
-}
-#======================================================
-$Mp4Folders = @{}
-$Mp4NameList = @()
-$Mp4InfoList = @()
-$keyIV_Table = @{}
-$lastPassword = $null
-$h0 = $null
 
-$buffer = new-object byte[](20kb)
-
-$rarFiles, $otherGroup =  findRar $args[0]
-checkPfm $dllDir
-
-cd $rarDir
-parseRARs $rarFiles $buffer
-if ($srtIscompressed){mountFilesNearRAR $rarDir}
-<#
-if(Test-Path MountData.txt){
-    loadData MountData.txt
-}else{
-    parseRARs $rarFiles $buffer
-    if ($srtIscompressed){mountFilesNearRAR $rarDir}
-    
-}
-#>
-
-if ($Mp4InfoList.count -eq 0) {Write-Host 'mp4 not found';pause;exit}
-#$Mp4Folders.'aa\bb' = $null
-#saveData $Mp4InfoList $rarDir
-#$Mp4InfoList[0][0].FolderPath = 'AAA\B'
-#$Mp4InfoList[0][0].FolderPath = @('AAA\B','QAZ\TE','BB')
+checkPfm
 Invoke-Expression $RarVolumeType
-startMount $autoOpen $driveLetter $MoutName $Mp4Folders $Mp4InfoList
+startMount $rarPath $autoOpen $driveLetter $MoutName
