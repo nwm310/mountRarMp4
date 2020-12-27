@@ -3,7 +3,7 @@
 #==================Edit Area================
 $driveLetter = 'Z'
 $MoutName = "thanks for sharing"
-$autoOpen = $false
+$autoOpen = $true
 $dllDir = ''
 
 #Check PS 5.0
