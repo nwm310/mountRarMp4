@@ -1,4 +1,4 @@
-﻿param([string]$rarPath = '')
+﻿param([string]$rarFilePath = '')
 
 #==================Edit Area================
 $driveLetter = 'Z'
@@ -35,7 +35,7 @@ function checkPfm(){
     popd
 }
 
-function startMount($rarPath, $autoOpen, $driveLetter, $MoutName){
+function startMount($rarFilePath, $autoOpen, $driveLetter, $MoutName){
     #ReadOnly (0x00000001)  UnmountOnRelease (0x00020000)
     #WorldWrite (0x00000008)
     $mountFlags = 0x20001
@@ -47,7 +47,7 @@ function startMount($rarPath, $autoOpen, $driveLetter, $MoutName){
 
     $msp = new-object Pfm+MarshallerServeParams  -prop @{
         volumeFlags = 1
-        dispatch = [RarVolume]::new($rarPath)
+        dispatch = [RarVolume]::new($rarFilePath)
         formatterName = "RarMp4Fs"  }
 
 
@@ -441,11 +441,11 @@ namespace SHA1SP {
     [hashtable]$FsTable = @{}
 
     #=============================
-    RAR([string]$rarPath){
-        $file = gi -literal $rarPath 2>$null
-        if ($file -eq $null){throw "$rarPath is not exist"}
-        if ($file.PSIsContainer){throw "$rarPath is not a file"}
-        if ($file.Extension -ne '.rar'){throw "$rarPath is not a rar file"}
+    RAR([string]$rarFilePath){
+        $file = gi -literal $rarFilePath 2>$null
+        if ($file -eq $null){throw "$rarFilePath is not exist"}
+        if ($file.PSIsContainer){throw "$rarFilePath is not a file"}
+        if ($file.Extension -ne '.rar'){throw "$rarFilePath is not a rar file"}
 
         $files = @()
         if ($file.name -match '(?<name>.*)\.part(?<num>\d+)\.rar'){ # multiVolumes
@@ -1163,6 +1163,8 @@ class rarEntry{
 }
 
 class File{
+    [string]$FullName = ''
+
     [int]$nameCount = 0
     [int]$fileType = 0
     [int]$fileFlags = 0
@@ -1190,8 +1192,9 @@ class File{
     #>
 
     File([rarEntry]$entry){
-
+        $this.FullName = $entry.FullName
         $this.fileSize = $entry.Size
+
         if($entry.IsDir){
             $this.fileType = 2
             $this.children = [System.Collections.SortedList]::new()
@@ -1213,13 +1216,24 @@ class File{
         $this.children = [System.Collections.SortedList]::new()
     }
 
-    static [File]makeFile([rarEntry[]]$entries, [uint32]$index, [hashtable]$FsTable){
+    static [File[]]makeFile([rarEntry[]]$entries, [hashtable]$FsTable){
+        $result = @(
+            for ($i = 0; $i -lt $entries.Count; $i++){
+
+                if ($entries[$i].IsCompress){continue}
+                [File]::makeFile($entries, [ref]$i, $FsTable)
+            }
+        )
+        return $result
+    }
+
+    static [File]makeFile([rarEntry[]]$entries, [ref]$index, [hashtable]$FsTable){
 
         $File = $null
         $nextPartN = $nEmpty = $MountFileOffset = $midPackSize = $FullPack = 0
 
         while($true){
-            $entry = $entries[$index]
+            $entry = $entries[$index.Value]
 
             # for multi part entry
             [uint32]$partN = 0
@@ -1305,7 +1319,7 @@ class File{
             
             # single pack or last pack
             if($entry.PackType -eq 0 -or $entry.PackType -eq 1 -or
-                ($index+1) -eq $entries.Count -or $entry.FullName -ne $entries[$index+1].FullName ){
+                ($index.Value+1) -eq $entries.Count -or $entry.FullName -ne $entries[$index.Value+1].FullName ){
 
                 if ($File.Parts[0] -eq $null){
                     if ($entry.PackType -eq 3){$File = $null; continue}
@@ -1347,7 +1361,7 @@ class File{
                 break
             }
 
-            $index++
+            $index.Value++
         }
         return $File
     }
@@ -1640,7 +1654,7 @@ class RarVolume: Pfm+FormatterDispatch{
 
 
 
-RarVolume([string]$rarPath){
+RarVolume([string]$rarFilePath){
     $this.lastFileId = 1
     $this.lastOpenSequence = 0
     $this.openRefs = [System.Collections.Generic.SortedDictionary[long,Object]]::new()
@@ -1651,42 +1665,48 @@ RarVolume([string]$rarPath){
     $this.root.fileId = 1
     $this.fileIds[$this.root.fileId] = $this.root
 
-    $rar = [RAR]::new($rarPath)
-    $this.makeFromRAR($rar.entries, $rar.FsTable)
+    $rar = [RAR]::new($rarFilePath)
+    $files = [File]::makeFile($rar.entries, $rar.FsTable)
+    $this.makeTree($files)
 }
 
-[void]makeFromRAR([rarEntry[]]$entries, [hashtable]$FsTable){
+[void]makeTree([File[]]$files){
 
-    for ($i = 0; $i -lt $entries.Count; $i++){
-        $entry = $entries[$i]
+    foreach ($file in $files){
 
-        if ($entry.IsCompress){continue}
-
-        $arrName = @($entry.FullName -split '[/\\]')
+        $arrName = @($file.FullName -split '[/\\]')
         $parent = $null
-        $file = $null
+        $f = $null
         $endName = $null
 
-        $perr = $this.FileFindName($arrName, [ref]$parent, [ref]$file, [ref]$endName)
+        $perr = $this.FileFindName($arrName, [ref]$parent, [ref]$f, [ref]$endName)
 
         if ($perr -eq 0 -or $perr -eq [Pfm]::ErrorInvalid){continue}
 
-        if ($entry.IsDir){ # entry is folder
-            $this.makeFolder($entry.FullName) > $null
+        if ($file.fileType -eq [Pfm]::fileTypeFolder){ # $file is folder
+            $this.makeFolder($file.FullName) > $null
             continue
         }
 
-        # $entry is file
-        $folderPath = Split-Path $entry.FullName
+        # $file is file
+        $folderPath = Split-Path $file.FullName
         $parent = $this.makeFolder($folderPath)
 
         if ($parent-eq $null){continue}
-        $file = [File]::makeFile($entries, $i, $FsTable)
-        if ($file -eq $null){continue}
 
-        $endName = $entry.Name
+        $endName = Split-Path $file.FullName -Leaf
         $this.FileNameAdd($parent, 0, $endName, $file)
     }
+    
+    pushd (Split-Path $script:rarFilePath)
+    foreach ($Key in $this.fileIds.Keys){
+        $data = ConvertTo-Json $this.fileIds[$Key] -Depth 3
+        $data >> MountData.txt
+        
+    }
+    
+    #sc -Path MountData.txt -Value $data  -enc UTF8
+    popd
 }
 
 [File]makeFolder([string]$FolderPath){
@@ -1712,6 +1732,7 @@ RarVolume([string]$rarPath){
     }
 
     $file = [File]::new([Pfm]::fileTypeFolder, 0, 0)
+    $file.FullName = $FolderPath
     $endName = Split-Path $folderPath -Leaf
     $this.FileNameAdd($parent, 0, $endName, $file)
 
@@ -2152,24 +2173,31 @@ RarVolume([string]$rarPath){
 }
 '@
 
-#if starting ps1 by right click ps1
-if ($MyInvocation.Line -match '^if\(\(Get-ExecutionPolicy'){ cd -literal $PSScriptRoot }
+cd -literal $PSScriptRoot
 
-if ($rarPath -ne ''){
-    if (!(Test-Path -literal $rarPath -PathType Leaf)){
-        $rarPath = ''
+if ($rarFilePath -like '*.rar'){
+    if (Test-Path -literal $rarFilePath -PathType Leaf){
+        $file = gi -literal $rarFilePath
+        $rarFilePath = $file.FullName
+        cd -literal $file.DirectoryName
+    
+    }else{
+        $rarFilePath = ''
     }
+
+}else{
+    $rarFilePath = ''
 }
 
-if ($rarPath -eq ''){
+if ($rarFilePath -eq ''){
     $files = @(dir *.rar -file)
     if ($files.Count -gt 0){
-        $rarPath = $files[0].FullName
+        $rarFilePath = $files[0].FullName
     }else{
-        Write-Host 'rar not found'
+        Write-Host 'rar not found'; pause; exit
     }
 }
 
 checkPfm
 Invoke-Expression $RarVolumeType
-startMount $rarPath $autoOpen $driveLetter $MoutName
+startMount $rarFilePath $autoOpen $driveLetter $MoutName
