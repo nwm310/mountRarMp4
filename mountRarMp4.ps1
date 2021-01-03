@@ -95,344 +95,230 @@ class RAR {
 
     [bool]$IsHeadEncrypt = $false
     [System.Security.Cryptography.AesCryptoServiceProvider]$AesForAll = $null
-    static [string]$SHA1SPdef =  @'
-// modify version of  SHA1CryptoServiceProvider.cs 
-// for calculation of  rar3 key iv
-//
-// original version from
-// https://github.com/mono/mono/blob/master/mcs/class/corlib/System.Security.Cryptography/SHA1CryptoServiceProvider.cs
-// Authors:
-//	Matthew S. Ford (Matthew.S.Ford@Rose-Hulman.Edu)
-//	Sebastien Pouliot (sebastien@ximian.com)
-//
-// Copyright 2001 by Matthew S. Ford.
-// Copyright (C) 2004, 2005, 2008 Novell, Inc (http://www.novell.com)
-
-
-
-using System.Runtime.InteropServices;
-
-namespace SHA1SP {
-
-	public class SHA1SP {
-	
-		private const int BLOCK_SIZE_BYTES =  64;
-		private uint[] _H;  // these are my chaining variables
-		private ulong count;
-		private byte[] _ProcessingBuffer;   // Used to start data when passed less than a block worth.
-		private int _ProcessingBufferCount; // Counts how much data we have stored that still needs processed.
-		private uint[] buff;
-
-		public SHA1SP () 
-		{
-			_H = new uint[5];
-			_ProcessingBuffer = new byte[BLOCK_SIZE_BYTES];
-			buff = new uint[80];
-			
-			Initialize();
-        }
-        ~SHA1SP () 
-        {
-
-        }
-
-		public void HashCore (byte[] rgb, int ibStart, int cbSize) 
-		{
-			int i;
-            bool secondBlock = false;
-			if (_ProcessingBufferCount != 0) {
-				if (cbSize < (BLOCK_SIZE_BYTES - _ProcessingBufferCount)) {
-					System.Buffer.BlockCopy (rgb, ibStart, _ProcessingBuffer, _ProcessingBufferCount, cbSize);
-					_ProcessingBufferCount += cbSize;
-					return;
-				}
-				else {
-					i = (BLOCK_SIZE_BYTES - _ProcessingBufferCount);
-					System.Buffer.BlockCopy (rgb, ibStart, _ProcessingBuffer, _ProcessingBufferCount, i);
-					ProcessBlock (_ProcessingBuffer, 0);
-					_ProcessingBufferCount = 0;
-					ibStart += i;
-                    cbSize -= i;
-                    secondBlock = true;
-				}
-			}
-
-
-			for (i = 0; i < cbSize - cbSize % BLOCK_SIZE_BYTES; i += BLOCK_SIZE_BYTES) {
-                ProcessBlock (rgb, (uint)(ibStart + i));
-
-                if (secondBlock){
-                    for (int j=0; j<16; j++) {
-                        System.Array.Copy(  System.BitConverter.GetBytes(this.buff[j+64]) , 
-                          0, rgb, ibStart + i + j*4 , 4);
+    static [string]$SHA1SPdef = @'
+    // https://zh.wikipedia.org/wiki/SHA-1
+    // https://github.com/mono/mono/blob/master/mcs/class/corlib/System.Security.Cryptography/SHA1CryptoServiceProvider.cs
+    
+    
+    namespace SHA1SP {
+    
+        public class SHA1SP {
+            private uint[] H = new uint[5];
+            private uint[] w = new uint[80];
+            private byte[] buffer = new byte[64];
+            private int bufferCount = 0;
+            private long processCount = 0;
+            private bool ForRAR3 = false;
+    
+    
+            public SHA1SP (){
+                H[0] = 0x67452301;
+                H[1] = 0xEFCDAB89;
+                H[2] = 0x98BADCFE;
+                H[3] = 0x10325476;
+                H[4] = 0xC3D2E1F0;
+            }
+    
+            public SHA1SP (bool isForRAR3) : this(){
+                ForRAR3 = isForRAR3;
+            }
+    
+            public void Reset (){
+                H[0] = 0x67452301;
+                H[1] = 0xEFCDAB89;
+                H[2] = 0x98BADCFE;
+                H[3] = 0x10325476;
+                H[4] = 0xC3D2E1F0;
+    
+                processCount = 0;
+                bufferCount = 0;
+            }
+    
+            public long TransformBlock(byte[] data, long start, long Len){
+                if (null == data || Len == 0){return 0;}
+    
+                long end = start + Len;
+                bool afterFirstBlock = false;
+    
+                int n = 0;
+                if (bufferCount != 0){
+                    n = 64 - bufferCount;
+    
+                    if (Len < n){
+                        System.Array.Copy(data, start, buffer, bufferCount, Len);
+                        bufferCount += (int)Len;
+                        return Len;
+    
+                    }else{
+                        System.Array.Copy(data, start, buffer, bufferCount, n);
+                        process64(buffer, 0);
+                        processCount += 64;
+    
+                        bufferCount = 0;
+                        start += n;
+                        afterFirstBlock = true;
+                    }
+    
+                }
+    
+                byte[] w4bytes = new byte[4];
+                while (start + 64 <= end) {
+                    process64(data, start);
+    
+                    if (afterFirstBlock && ForRAR3){
+                        for (int i = 0; i < 16; i++){
+                            w4bytes[0] = (byte)(w[64+i]);
+                            w4bytes[1] = (byte)(w[64+i] >> 8);
+                            w4bytes[2] = (byte)(w[64+i] >> 16);
+                            w4bytes[3] = (byte)(w[64+i] >> 24);
+                            System.Array.Copy(w4bytes, 0, data, start + i*4, 4);
+                        }
+                    }
+    
+                    processCount += 64;
+                    start += 64;
+                    afterFirstBlock = true;
+                }
+    
+                if (start < end){
+                    System.Array.Copy(data, start, buffer, 0, end - start);
+                    bufferCount = (int)(end - start);
+                }
+    
+                return Len;
+            }
+    
+            public byte[] TransformFinalBlock (byte[] data, long start, long Len){
+                TransformBlock(data, start, Len);
+    
+                if (bufferCount == 0 && processCount == 0){return null;}
+    
+                int appendZeroCount = 0;
+                if (bufferCount < 56){
+                    appendZeroCount = 56 - bufferCount;
+            
+                }else if (bufferCount > 56){
+                    appendZeroCount = 64 - bufferCount + 56;
+                }
+    
+                int finalBlockLen = bufferCount + appendZeroCount + 8;
+                byte[] finalBlock = new byte [finalBlockLen];
+    
+                int i;
+                for (i = 0; i < bufferCount; i++){
+                    finalBlock[i] = buffer[i];
+                }
+    
+                int j;
+                if (bufferCount != 56){
+                    finalBlock[i++] = 128;
+                    
+                    for (j = 1; j < appendZeroCount; j++){
+                        finalBlock[i++] = 0;
                     }
                 }
-
-                secondBlock = true;
-			}
-
-			if (cbSize % BLOCK_SIZE_BYTES != 0) {
-				System.Buffer.BlockCopy (rgb, cbSize - cbSize % BLOCK_SIZE_BYTES + ibStart, _ProcessingBuffer, 0, cbSize % BLOCK_SIZE_BYTES);
-				_ProcessingBufferCount = cbSize % BLOCK_SIZE_BYTES;
-			}
-		}
-
-		public byte[] HashFinal () 
-		{
-			byte[] hash = new byte[20];
-
-			ProcessFinalBlock (_ProcessingBuffer, 0, _ProcessingBufferCount);
-
-			for (int i=0; i<5; i++) {
-				for (int j=0; j<4; j++) {
-					hash [i*4+j] = (byte)(_H[i] >> (8*(3-j)));
-				}
-			}
-
-			return hash;
-		}
-
-		public byte[] HashForIV () 
-		{
-            uint[] Hcopy = new uint[5];
-            for (int i=0; i<5; i++) {
-                Hcopy[i] = this._H[i];
+    
+                ulong TotalCount = (ulong)((processCount + bufferCount) * 8);
+                finalBlock[i++] = (byte)(TotalCount >> 56);
+                finalBlock[i++] = (byte)(TotalCount >> 48);
+                finalBlock[i++] = (byte)(TotalCount >> 40);
+                finalBlock[i++] = (byte)(TotalCount >> 32);
+                finalBlock[i++] = (byte)(TotalCount >> 24);
+                finalBlock[i++] = (byte)(TotalCount >> 16);
+                finalBlock[i++] = (byte)(TotalCount >>  8);
+                finalBlock[i] = (byte)(TotalCount);
+    
+                uint[] HCopy = new uint[5];
+                if (ForRAR3){
+                    for (i = 0; i < 5; i++){
+                        HCopy[i] = H[i];
+                    }
+                }
+    
+                process64(finalBlock, 0);
+    
+                if (finalBlockLen == 128){
+                    process64(finalBlock, 64);
+                }
+    
+                
+                byte[] result = new byte[20];
+                for (i = 0; i < 5; i++){
+                    result[i*4]   = (byte)(H[i] >> 24);
+                    result[i*4+1] = (byte)(H[i] >> 16);
+                    result[i*4+2] = (byte)(H[i] >>  8);
+                    result[i*4+3] = (byte)(H[i]);
+                }
+    
+                if (ForRAR3){
+                    for (i = 0; i < 5; i++){
+                        H[i] = HCopy[i];
+                    } 
+                }else{
+                    Reset();
+                }
+    
+                return result;
             }
-            ulong countCopy = this.count;
-
-			byte[] hash = new byte[20];
-
-			ProcessFinalBlock (_ProcessingBuffer, 0, _ProcessingBufferCount);
-
-			for (int i=0; i<5; i++) {
-				for (int j=0; j<4; j++) {
-					hash [i*4+j] = (byte)(_H[i] >> (8*(3-j)));
-				}
+    
+            private void process64(byte[] data, long start){
+                int i;
+                long j;
+                for(i = 0; i < 16; i++){
+                    j = start + i*4;
+                    w[i] = (uint)(data[j] << 24 | data[j+1] << 16 | data[j+2] << 8 | data[j+3]);
+                }
+    
+                uint temp;
+                for(i = 16; i < 80; i++){
+                    temp = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+                    w[i] = (temp << 1) | (temp >> 31);
+                }
+                
+                uint a = H[0];
+                uint b = H[1];
+                uint c = H[2];
+                uint d = H[3];
+                uint e = H[4];
+    
+            
+                uint f = 0;
+                uint k = 0;
+                for(i = 0; i < 80; i++){
+                    if (i < 20){
+                        f = (b & c) | ((~ b) & d);
+                        k = 0x5A827999;
+                    }else if (i < 40){
+                        f = b ^ c ^ d;
+                        k = 0x6ED9EBA1;
+            
+                    }else if (i < 60){
+                        f = (b & c) | (b & d) | (c & d);
+                        k = 0x8F1BBCDC;
+            
+                    }else{
+                        f = b ^ c ^ d;
+                        k = 0xCA62C1D6;
+                    }
+            
+                    temp = (a << 5 | a >> 27) + f + e + k + w[i];
+                    e = d;
+                    d = c;
+                    c = (b << 30) | (b >> 2);
+                    b = a;
+                    a = temp;
+                }
+    
+                H[0] += a;
+                H[1] += b;
+                H[2] += c;
+                H[3] += d;
+                H[4] += e;
+    
+                return;
             }
-            for (int i=0; i<5; i++) {
-                this._H[i] = Hcopy[i];
-            }
-            this.count = countCopy;
-
-			return hash;
-		}
-
-
-
-        public void Initialize () 
-		{
-			count = 0;
-			_ProcessingBufferCount = 0;
-
-			_H[0] = 0x67452301;
-			_H[1] = 0xefcdab89;
-			_H[2] = 0x98badcfe;
-			_H[3] = 0x10325476;
-			_H[4] = 0xC3D2E1F0;
-		}
-
-		private void ProcessBlock(byte[] inputBuffer, uint inputOffset) 
-		{
-			uint a, b, c, d, e;
-
-			count += BLOCK_SIZE_BYTES;
-
-			// abc removal would not work on the fields
-			uint[] _H = this._H;
-			uint[] buff = this.buff;
-			InitialiseBuff(buff, inputBuffer, inputOffset);
-			FillBuff(buff);
-
-			a = _H[0];
-			b = _H[1];
-			c = _H[2];
-			d = _H[3];
-			e = _H[4];
-
-			// This function was unrolled because it seems to be doubling our performance with current compiler/VM.
-			// Possibly roll up if this changes.
-
-			// ---- Round 1 --------
-			int i=0;
-			while (i < 20)
-			{
-				e += ((a << 5) | (a >> 27)) + (((c ^ d) & b) ^ d) + 0x5A827999 + buff[i];
-				b = (b << 30) | (b >> 2);
-
-				d += ((e << 5) | (e >> 27)) + (((b ^ c) & a) ^ c) + 0x5A827999 + buff[i+1];
-				a = (a << 30) | (a >> 2);
-
-				c += ((d << 5) | (d >> 27)) + (((a ^ b) & e) ^ b) + 0x5A827999 + buff[i+2];
-				e = (e << 30) | (e >> 2);
-
-				b += ((c << 5) | (c >> 27)) + (((e ^ a) & d) ^ a) + 0x5A827999 + buff[i+3];
-				d = (d << 30) | (d >> 2);
-
-				a += ((b << 5) | (b >> 27)) + (((d ^ e) & c) ^ e) + 0x5A827999 + buff[i+4];
-				c = (c << 30) | (c >> 2);
-				i += 5;
-			}
-
-			// ---- Round 2 --------
-			while (i < 40)
-			{
-				e += ((a << 5) | (a >> 27)) + (b ^ c ^ d) + 0x6ED9EBA1 + buff[i];
-				b = (b << 30) | (b >> 2);
-
-				d += ((e << 5) | (e >> 27)) + (a ^ b ^ c) + 0x6ED9EBA1 + buff[i + 1];
-				a = (a << 30) | (a >> 2);
-
-				c += ((d << 5) | (d >> 27)) + (e ^ a ^ b) + 0x6ED9EBA1 + buff[i + 2];
-				e = (e << 30) | (e >> 2);
-
-				b += ((c << 5) | (c >> 27)) + (d ^ e ^ a) + 0x6ED9EBA1 + buff[i + 3];
-				d = (d << 30) | (d >> 2);
-
-				a += ((b << 5) | (b >> 27)) + (c ^ d ^ e) + 0x6ED9EBA1 + buff[i + 4];
-				c = (c << 30) | (c >> 2);
-				i += 5;
-			}
-		   
-			// ---- Round 3 --------
-			while (i < 60)
-			{
-				e += ((a << 5) | (a >> 27)) + ((b & c) | (b & d) | (c & d)) + 0x8F1BBCDC + buff[i];
-				b = (b << 30) | (b >> 2);
-
-				d += ((e << 5) | (e >> 27)) + ((a & b) | (a & c) | (b & c)) + 0x8F1BBCDC + buff[i + 1];
-				a = (a << 30) | (a >> 2);
-
-				c += ((d << 5) | (d >> 27)) + ((e & a) | (e & b) | (a & b)) + 0x8F1BBCDC + buff[i + 2];
-				e = (e << 30) | (e >> 2);
-
-				b += ((c << 5) | (c >> 27)) + ((d & e) | (d & a) | (e & a)) + 0x8F1BBCDC + buff[i + 3];
-				d = (d << 30) | (d >> 2);
-
-				a += ((b << 5) | (b >> 27)) + ((c & d) | (c & e) | (d & e)) + 0x8F1BBCDC + buff[i + 4];
-				c = (c << 30) | (c >> 2);
-				i += 5;
-			}
-
-			// ---- Round 4 --------
-			while (i < 80)
-			{
-				e += ((a << 5) | (a >> 27)) + (b ^ c ^ d) + 0xCA62C1D6 + buff[i];
-				b = (b << 30) | (b >> 2);
-
-				d += ((e << 5) | (e >> 27)) + (a ^ b ^ c) + 0xCA62C1D6 + buff[i + 1];
-				a = (a << 30) | (a >> 2);
-
-				c += ((d << 5) | (d >> 27)) + (e ^ a ^ b) + 0xCA62C1D6 + buff[i + 2];
-				e = (e << 30) | (e >> 2);
-
-				b += ((c << 5) | (c >> 27)) + (d ^ e ^ a) + 0xCA62C1D6 + buff[i + 3];
-				d = (d << 30) | (d >> 2);
-
-				a += ((b << 5) | (b >> 27)) + (c ^ d ^ e) + 0xCA62C1D6 + buff[i + 4];
-				c = (c << 30) | (c >> 2);
-				i += 5;
-			}
-
-			_H[0] += a;
-			_H[1] += b;
-			_H[2] += c;
-			_H[3] += d;
-			_H[4] += e;
-		}
-
-		private static void InitialiseBuff(uint[] buff, byte[] input, uint inputOffset)
-		{
-			buff[0] = (uint)((input[inputOffset + 0] << 24) | (input[inputOffset + 1] << 16) | (input[inputOffset + 2] << 8) | (input[inputOffset + 3]));
-			buff[1] = (uint)((input[inputOffset + 4] << 24) | (input[inputOffset + 5] << 16) | (input[inputOffset + 6] << 8) | (input[inputOffset + 7]));
-			buff[2] = (uint)((input[inputOffset + 8] << 24) | (input[inputOffset + 9] << 16) | (input[inputOffset + 10] << 8) | (input[inputOffset + 11]));
-			buff[3] = (uint)((input[inputOffset + 12] << 24) | (input[inputOffset + 13] << 16) | (input[inputOffset + 14] << 8) | (input[inputOffset + 15]));
-			buff[4] = (uint)((input[inputOffset + 16] << 24) | (input[inputOffset + 17] << 16) | (input[inputOffset + 18] << 8) | (input[inputOffset + 19]));
-			buff[5] = (uint)((input[inputOffset + 20] << 24) | (input[inputOffset + 21] << 16) | (input[inputOffset + 22] << 8) | (input[inputOffset + 23]));
-			buff[6] = (uint)((input[inputOffset + 24] << 24) | (input[inputOffset + 25] << 16) | (input[inputOffset + 26] << 8) | (input[inputOffset + 27]));
-			buff[7] = (uint)((input[inputOffset + 28] << 24) | (input[inputOffset + 29] << 16) | (input[inputOffset + 30] << 8) | (input[inputOffset + 31]));
-			buff[8] = (uint)((input[inputOffset + 32] << 24) | (input[inputOffset + 33] << 16) | (input[inputOffset + 34] << 8) | (input[inputOffset + 35]));
-			buff[9] = (uint)((input[inputOffset + 36] << 24) | (input[inputOffset + 37] << 16) | (input[inputOffset + 38] << 8) | (input[inputOffset + 39]));
-			buff[10] = (uint)((input[inputOffset + 40] << 24) | (input[inputOffset + 41] << 16) | (input[inputOffset + 42] << 8) | (input[inputOffset + 43]));
-			buff[11] = (uint)((input[inputOffset + 44] << 24) | (input[inputOffset + 45] << 16) | (input[inputOffset + 46] << 8) | (input[inputOffset + 47]));
-			buff[12] = (uint)((input[inputOffset + 48] << 24) | (input[inputOffset + 49] << 16) | (input[inputOffset + 50] << 8) | (input[inputOffset + 51]));
-			buff[13] = (uint)((input[inputOffset + 52] << 24) | (input[inputOffset + 53] << 16) | (input[inputOffset + 54] << 8) | (input[inputOffset + 55]));
-			buff[14] = (uint)((input[inputOffset + 56] << 24) | (input[inputOffset + 57] << 16) | (input[inputOffset + 58] << 8) | (input[inputOffset + 59]));
-			buff[15] = (uint)((input[inputOffset + 60] << 24) | (input[inputOffset + 61] << 16) | (input[inputOffset + 62] << 8) | (input[inputOffset + 63]));
-		}
-
-		private static void FillBuff(uint[] buff)
-		{
-			uint val;
-			for (int i = 16; i < 80; i += 8)
-			{
-				val = buff[i - 3] ^ buff[i - 8] ^ buff[i - 14] ^ buff[i - 16];
-				buff[i] = (val << 1) | (val >> 31);
-
-				val = buff[i - 2] ^ buff[i - 7] ^ buff[i - 13] ^ buff[i - 15];
-				buff[i + 1] = (val << 1) | (val >> 31);
-
-				val = buff[i - 1] ^ buff[i - 6] ^ buff[i - 12] ^ buff[i - 14];
-				buff[i + 2] = (val << 1) | (val >> 31);
-
-				val = buff[i + 0] ^ buff[i - 5] ^ buff[i - 11] ^ buff[i - 13];
-				buff[i + 3] = (val << 1) | (val >> 31);
-
-				val = buff[i + 1] ^ buff[i - 4] ^ buff[i - 10] ^ buff[i - 12];
-				buff[i + 4] = (val << 1) | (val >> 31);
-
-				val = buff[i + 2] ^ buff[i - 3] ^ buff[i - 9] ^ buff[i - 11];
-				buff[i + 5] = (val << 1) | (val >> 31);
-
-				val = buff[i + 3] ^ buff[i - 2] ^ buff[i - 8] ^ buff[i - 10];
-				buff[i + 6] = (val << 1) | (val >> 31);
-
-				val = buff[i + 4] ^ buff[i - 1] ^ buff[i - 7] ^ buff[i - 9];
-				buff[i + 7] = (val << 1) | (val >> 31);
-			}
-		}
-	
-		private void ProcessFinalBlock (byte[] inputBuffer, int inputOffset, int inputCount) 
-		{
-			ulong total = count + (ulong)inputCount;
-			int paddingSize = (56 - (int)(total % BLOCK_SIZE_BYTES));
-
-			if (paddingSize < 1)
-				paddingSize += BLOCK_SIZE_BYTES;
-
-			int length = inputCount+paddingSize+8;
-			byte[] fooBuffer = (length == 64) ? _ProcessingBuffer : new byte[length];
-
-			for (int i=0; i<inputCount; i++) {
-				fooBuffer[i] = inputBuffer[i+inputOffset];
-			}
-
-			fooBuffer[inputCount] = 0x80;
-			for (int i=inputCount+1; i<inputCount+paddingSize; i++) {
-				fooBuffer[i] = 0x00;
-			}
-
-			// I deal in bytes. The algorithm deals in bits.
-			ulong size = total << 3;
-			AddLength (size, fooBuffer, inputCount+paddingSize);
-			ProcessBlock (fooBuffer, 0);
-
-			if (length == 128)
-				ProcessBlock (fooBuffer, 64);
-		}
-
-		internal void AddLength (ulong length, byte[] buffer, int position)
-		{
-			buffer [position++] = (byte)(length >> 56);
-			buffer [position++] = (byte)(length >> 48);
-			buffer [position++] = (byte)(length >> 40);
-			buffer [position++] = (byte)(length >> 32);
-			buffer [position++] = (byte)(length >> 24);
-			buffer [position++] = (byte)(length >> 16);
-			buffer [position++] = (byte)(length >>  8);
-			buffer [position]   = (byte)(length);
-		}
-	}
-}
+        }
+    }
 '@
     [hashtable]$AesTable = @{}
     [string]$password = ''
@@ -987,7 +873,7 @@ namespace SHA1SP {
     }
 
     [System.Security.Cryptography.AesCryptoServiceProvider]getAes ([byte]$Ver, [string]$password, [byte[]]$salt, [byte]$KDFcount, [byte[]]$checkValue){
-      
+        
         #https://github.com/lclevy/unarcrypto
         #https://stackoverflow.com/questions/18648084/rfc2898-pbkdf2-with-sha256-as-digest-in-c-sharp
     
@@ -1001,7 +887,6 @@ namespace SHA1SP {
             }
             
             $this.password = $password
-
             $seed = [System.Text.Encoding]::Unicode.GetBytes($password) + $salt
             
             # in powershell , must : New-Object to create space , then copy seed to space
@@ -1010,20 +895,21 @@ namespace SHA1SP {
         
             [byte[]]$iv = @(0) * 16
             if ( ! ('SHA1SP.SHA1SP' -as [type])){Add-Type -TypeDef ([RAR]::SHA1SPdef) }
-            $sha1 = new-object SHA1SP.SHA1SP
+            $sha1 = new-object SHA1SP.SHA1SP $true
         
             for($i = 0; $i -lt 16; $i++){
                 for($j = 0; $j -lt 0x4000; $j++){
                     $count = [System.BitConverter]::GetBytes($i*0x4000 + $j)
-                    $sha1.HashCore($seedNew, 0, $seedNew.length) > $null
-                    $sha1.HashCore($count, 0, 3) >$null
+                    $sha1.TransformBlock($seedNew, 0, $seedNew.length) > $null
+                    $sha1.TransformBlock($count, 0, 3) > $null
                     if ($j -eq 0){
-                        $hash = $sha1.HashForIV()
+                        $hash = $sha1.TransformFinalBlock($null, 0, 0)
                         $iv[$i] = $hash[19]
                     }
                 }
             }
-            $hash = $sha1.HashFinal()
+            # $hash = $sha1.HashFinal()
+            $hash = $sha1.TransformFinalBlock($null, 0, 0)
             [byte[]]$key = $hash[3..0] + $hash[7..4] + $hash[11..8] + $hash[15..12]
     
         }elseif ($Ver -eq 5){
@@ -1108,7 +994,7 @@ namespace SHA1SP {
             $this.AesTable."$checkValue" = $Aes
         }
         
-    
+
         return $Aes
     }
 
