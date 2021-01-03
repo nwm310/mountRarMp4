@@ -1584,15 +1584,7 @@ RarVolume([string]$rarFilePath){
         $this.FileNameAdd($parent, 0, $endName, $file)
     }
     
-    pushd (Split-Path $script:rarFilePath)
-    foreach ($Key in $this.fileIds.Keys){
-        $data = ConvertTo-Json $this.fileIds[$Key] -Depth 3
-        $data >> MountData.txt
-        
-    }
-    
-    #sc -Path MountData.txt -Value $data  -enc UTF8
-    popd
+
 }
 
 [File]makeFolder([string]$FolderPath){
