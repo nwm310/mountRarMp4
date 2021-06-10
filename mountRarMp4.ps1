@@ -5,6 +5,7 @@ $driveLetter = 'Z'
 $MoutName = "thanks for sharing"
 $autoOpen = $true
 $dllDir = ''
+$dontMakeFolder = $true
 
 #Check PS 5.0
 if ($host.Version.Major -lt 5){Write-Host 'NEED PowerShell 5.0';pause;exit}
@@ -99,7 +100,8 @@ class RAR {
     // https://zh.wikipedia.org/wiki/SHA-1
     // https://github.com/mono/mono/blob/master/mcs/class/corlib/System.Security.Cryptography/SHA1CryptoServiceProvider.cs
     
-    
+    // For caculating RAR 3 key IV
+    // It's different than other SHA1 algorithm when input data length greater than 64
     namespace SHA1SP {
     
         public class SHA1SP {
@@ -108,8 +110,6 @@ class RAR {
             private byte[] buffer = new byte[64];
             private int bufferCount = 0;
             private long processCount = 0;
-            private bool ForRAR3 = false;
-    
     
             public SHA1SP (){
                 H[0] = 0x67452301;
@@ -117,10 +117,6 @@ class RAR {
                 H[2] = 0x98BADCFE;
                 H[3] = 0x10325476;
                 H[4] = 0xC3D2E1F0;
-            }
-    
-            public SHA1SP (bool isForRAR3) : this(){
-                ForRAR3 = isForRAR3;
             }
     
             public void Reset (){
@@ -134,9 +130,11 @@ class RAR {
                 bufferCount = 0;
             }
     
-            public long TransformBlock(byte[] data, long start, long Len){
-                if (null == data || Len == 0){return 0;}
+            public void update(byte[] data){
+                if (null == data){return;}
     
+                long start = 0;
+                long Len = data.Length;
                 long end = start + Len;
                 bool afterFirstBlock = false;
     
@@ -145,12 +143,12 @@ class RAR {
                     n = 64 - bufferCount;
     
                     if (Len < n){
-                        System.Array.Copy(data, start, buffer, bufferCount, Len);
+                        System.Array.Copy(data, 0, buffer, bufferCount, Len);
                         bufferCount += (int)Len;
-                        return Len;
+                        return;
     
                     }else{
-                        System.Array.Copy(data, start, buffer, bufferCount, n);
+                        System.Array.Copy(data, 0, buffer, bufferCount, n);
                         process64(buffer, 0);
                         processCount += 64;
     
@@ -165,7 +163,7 @@ class RAR {
                 while (start + 64 <= end) {
                     process64(data, start);
     
-                    if (afterFirstBlock && ForRAR3){
+                    if (afterFirstBlock){
                         for (int i = 0; i < 16; i++){
                             w4bytes[0] = (byte)(w[64+i]);
                             w4bytes[1] = (byte)(w[64+i] >> 8);
@@ -185,37 +183,27 @@ class RAR {
                     bufferCount = (int)(end - start);
                 }
     
-                return Len;
+                return;
             }
     
-            public byte[] TransformFinalBlock (byte[] data, long start, long Len){
-                TransformBlock(data, start, Len);
-    
+            public byte[] digest(){
                 if (bufferCount == 0 && processCount == 0){return null;}
     
-                int appendZeroCount = 0;
-                if (bufferCount < 56){
-                    appendZeroCount = 56 - bufferCount;
-            
-                }else if (bufferCount > 56){
-                    appendZeroCount = 64 - bufferCount + 56;
-                }
+                int finalBlockLen = 64;
+                if (bufferCount + 1 + 8 > 64){finalBlockLen = 128;}
     
-                int finalBlockLen = bufferCount + appendZeroCount + 8;
                 byte[] finalBlock = new byte [finalBlockLen];
     
-                int i;
-                for (i = 0; i < bufferCount; i++){
+                int i = 0;
+                for (; i < bufferCount; i++){
                     finalBlock[i] = buffer[i];
                 }
     
-                int j;
-                if (bufferCount != 56){
-                    finalBlock[i++] = 128;
-                    
-                    for (j = 1; j < appendZeroCount; j++){
-                        finalBlock[i++] = 0;
-                    }
+                finalBlock[i++] = 0x80;
+
+                int zeroEnd = finalBlockLen - 8;
+                for (; i < zeroEnd; i++){
+                    finalBlock[i] = 0;
                 }
     
                 ulong TotalCount = (ulong)((processCount + bufferCount) * 8);
@@ -229,10 +217,8 @@ class RAR {
                 finalBlock[i] = (byte)(TotalCount);
     
                 uint[] HCopy = new uint[5];
-                if (ForRAR3){
-                    for (i = 0; i < 5; i++){
-                        HCopy[i] = H[i];
-                    }
+                for (i = 0; i < 5; i++){
+                    HCopy[i] = H[i];
                 }
     
                 process64(finalBlock, 0);
@@ -240,7 +226,6 @@ class RAR {
                 if (finalBlockLen == 128){
                     process64(finalBlock, 64);
                 }
-    
                 
                 byte[] result = new byte[20];
                 for (i = 0; i < 5; i++){
@@ -249,13 +234,9 @@ class RAR {
                     result[i*4+2] = (byte)(H[i] >>  8);
                     result[i*4+3] = (byte)(H[i]);
                 }
-    
-                if (ForRAR3){
-                    for (i = 0; i < 5; i++){
-                        H[i] = HCopy[i];
-                    } 
-                }else{
-                    Reset();
+
+                for (i = 0; i < 5; i++){
+                    H[i] = HCopy[i];
                 }
     
                 return result;
@@ -347,200 +328,99 @@ class RAR {
             $files += $file
         }
 
+        $this.setEntries($files)
+
+    }#end of Ctor
+
+    [void]setEntries($files){
         trap {$fs.close()}
         $buffer = new-object byte[](20KB)
         
         foreach ($file in $files) {
             $fs = $file.OpenRead()
             $this.FsTable[$file] = $fs
-            $this.beforeFileHeader($fs, $buffer)
-            $this.parseFileHeader($fs, $buffer, $file)
+            $n = $fs.read($buffer, 0, 8)
+            if ($n -ne 8) {throw "$($fs.Name) : file size is too small"}
+
+            if ([BitConverter]::ToString($buffer, 0, 7) -eq '52-61-72-21-1A-07-00'){
+                $this.Ver = 4
+                $fs.Position = 7
+                $this.setEntries4($fs, $buffer, $file)
+
+            }elseif ([BitConverter]::ToString($buffer, 0, 8) -eq '52-61-72-21-1A-07-01-00'){
+                $this.Ver = 5
+                $this.setEntries5($fs, $buffer, $file)
+            
+            }else{throw "$($fs.Name) is not RAR"}
         }        
         $buffer = $null
-
-    }#end of Ctor
-
-    [void]beforeFileHeader([IO.FileStream]$fs, [byte[]]$buffer){
-
-        $n = $fs.read($buffer , 0 , 8)
-        if ($n -lt 8) {throw "$($fs.Name) : file size is too small"}
-    
-        if ([BitConverter]::ToString($buffer,0,7) -eq '52-61-72-21-1A-07-00'){
-            $this.Ver = 4
-            $fs.Position = 7
-            $result = $this.getHeader4($fs, $buffer, $null)
-            
-            if ($result.HeadTypeName -ne 'Main') {throw "$($fs.Name) : Main header error"}
-            
-            if ($result.IsEncrypt){
-                $this.IsHeadEncrypt = $result.IsEncrypt
-                $this.AesForAll = $this.getAes($this.Ver, $this.password, $result.Salt, $null, $null)
-            }
-    
-        }elseif ([BitConverter]::ToString($buffer,0,8) -eq '52-61-72-21-1A-07-01-00'){
-            $this.Ver = 5
-            $result = $this.getHeader5($fs, $buffer, $null)
-
-            if ($result.HeadTypeName -ne 'Main' -and $result.HeadTypeName -ne 'Encryption'){
-                throw "$($fs.Name) : Main header error"
-            }
-
-            if ($result.IsEncrypt){
-                $this.IsHeadEncrypt = $result.IsEncrypt
-                $this.AesForAll = $this.getAes($this.Ver, $this.password, $result.Salt, $result.KDFcount, $result.checkValue)
-                
-                [byte[]]$iv = new-object byte[] 16
-                $n = $fs.read($iv, 0, 16)
-                if ($n -lt 16) {throw "$($fs.Name) : file size is too small"}
-                $this.AesForAll.IV = $iv
-
-                $cs = new-object System.Security.Cryptography.CryptoStream (
-                    $fs, $this.AesForAll.CreateDecryptor(), 0
-                )
-
-                $result = $this.getHeader5($cs, $buffer, $fs)
-    
-                if ($result.HeadTypeName -ne 'Main'){;throw "$($fs.Name) : Main header error"}
-                $cs = $null
-
-            }# end of if ($result.IsEncrypt)
-
-        }else{throw "$($fs.Name) is not RAR"}
     }
 
-    [void]parseFileHeader([IO.FileStream]$fs, [byte[]]$buffer, [IO.FileInfo]$fileInfo){
-
+    [void]setEntries4($fs, [byte[]]$buffer, [IO.FileInfo]$file){
+                
+        $prev_HeadType = 0
+        $fs0 = $null
         while ($fs.Position -lt $fs.length){
 
-            # read header
-            if ($this.Ver -eq 4){
-                if ($this.IsHeadEncrypt){
-                    # salt already read
-                    # all salts are the same.  skip it
-                    $fs.position += 8
-    
-                    $cs = new-object System.Security.Cryptography.CryptoStream (
-                        $fs, $this.AesForAll.CreateDecryptor(), 0
-                    )
-    
-                    $result = $this.getHeader4($cs, $buffer, $fs)
-                    $cs = $null
-                
-                }else{
-                    $result = $this.getHeader4($fs, $buffer, $null)
-                }
-    
-            }elseif ($this.Ver -eq 5){
-                if ($this.IsHeadEncrypt){
-                    $iv = new-object byte[] 16
-                    $n = $fs.read($iv, 0, 16)
-                    if ($n -lt 16) {throw "$($fs.Name) : file size is too small"}
-            
-                    $this.AesForAll.IV = $iv
-            
-                    $cs = new-object System.Security.Cryptography.CryptoStream (
-                        $fs, $this.AesForAll.CreateDecryptor(), 0
-                    )
-            
-                    $result = $this.getHeader5($cs, $buffer, $fs)
-                    $cs = $null
-                }else{
-                    $result = $this.getHeader5($fs, $buffer, $null)
-                }
-            
-            }else{throw 'RAR version error'}
+            $FullName = $FileSize = $IsDir = 
+            $IsCompress = $IsFileEncrypt = 
+            $PackType = $PackOffset = $PackSize = $false
 
-            if ($result.HeadTypeName -eq 'File'){
-                [rarEntry]$entry = [rarEntry]::new($result)
-                $entry.rarFileInfo = $fileInfo
+            $Salt = $Aes = $null
 
-                if ($result.PackOffset + $result.PackSize -gt $fs.length) {
-                    $entry.ActualPackSize = $fs.length - $result.PackOffset
-                }else{
-                    $entry.ActualPackSize = $result.PackSize
-                }
-                
-                if ($this.IsHeadEncrypt){
-                    $entry.Aes = $this.AesForAll
-                }elseif ($result.IsEncrypt){
-                    $entry.Aes = $this.getAes($this.Ver, $this.password, $result.Salt, $result.KDFcount, $result.checkValue)
-                }
-    
-                if ($null -ne $entry.Aes){
-                    if ($this.Ver -eq 4){
-                        $entry.iv0 = $entry.Aes.IV
-                    }else{# Ver 5
-                        $entry.iv0 = $result.iv
-                    }
-                }
-                
-                $this.Entries += $entry
+            if ($this.IsHeadEncrypt){
+                # salt already read
+                # all salts are the same.  skip it
+                $fs.position += 8
+
+                $fs0 = $fs
+                $fs = new-object System.Security.Cryptography.CryptoStream (
+                    $fs0, $this.AesForAll.CreateDecryptor(), 0
+                )
             }
 
-            #Is this block  the last block need to be processed  ? 
-            $PackEnd = $result.PackOffset + $result.PackSize
-            switch -w  ($result.PackType) {
-                #First pack  or Middle pack
-                #no block after this block  need to be processed
-                [23]{return}
-    
-                [01]{ # normal pack  or last pack
-                    
-                    if ($PackEnd -gt $fs.length) {
-                        return
-                    }else{
-                        $fs.Position = $PackEnd
-                    }
-                }
-                default{$fs.Position = $PackEnd}
+            $n = $fs.read($buffer, 0, 7)
+            if ($n -ne 7) {throw "$($fs.Name) : file size is too small"}
+
+            $HeadType = $buffer[2]
+            $HeadFlag = [BitConverter]::ToUInt16($buffer, 3)
+            $HeadSize = [BitConverter]::ToUInt16($buffer, 5)
+        
+            $n = $HeadSize - 7
+            $n1 = $fs.read($buffer, 7, $n)
+        
+            if ($n1 -ne $n) {throw "$($fs.Name) : file size is too small"}
+            if ($this.IsHeadEncrypt){
+                $fs = $null
+                $fs = $fs0
             }
-        }    
-    }
-
-    [PSCustomObject]getHeader4($fs, [byte[]]$buffer, [IO.FileStream]$fs0){
-        
-        $HeadTypeName = $IsEncrypt = $Salt = 
-        $PackType = $PackOffset = $PackSize =
-        $FullName = $FileSize = $IsCompress = $IsDir =
-        $KDFcount = $iv = $checkValue = $FileLinkType = $targetName = $false
-
-        $n = $fs.read($buffer, 0, 7)
-        if ($n -lt 7) {throw "$($fs.Name) : file size is too small"}
-        
-        $HeadType = $buffer[2]
-        $HeadFlag = [BitConverter]::ToUInt16($buffer ,3)
-        $HeadSize = [BitConverter]::ToUInt16($buffer ,5)
-    
-        $n = $HeadSize - 7
-        $n1 = $fs.read($buffer, 7, $n)
-    
-        if ($n1 -lt $n) {throw "$($fs.Name) : file size is too small"}
-    
-        #=============after reading  header into buffer===============
-        if ($fs0 -ne $null){ # rar header is encrypted
-            $PackOffset = $fs0.position
-        }else{
             $PackOffset = $fs.position
-        }
-        
-        switch ($HeadType){
-            0x73{
-                $HeadTypeName = 'Main'
+            #========================================================
+            if ($prev_HeadType -eq 0 -and $HeadType -ne 0x73){
+                #first header must be main header
+                throw "$($fs.Name) : Main header error"
+            }else{
+                $prev_HeadType = $HeadType
+            }
+
+            if ($HeadType -eq 0x73){# parse main header
                 if ($HeadFlag -band 0x80){
-                    $IsEncrypt = $true
-    
-                    #read salt after this header
-                    $Salt = new-object byte[] 8
-                    $n = $fs.read($Salt, 0, 8)
-                    if ($n -lt 8) {throw "$($fs.Name) : file size is too small"}
+                    $this.IsHeadEncrypt = $true
+
+                    #read salt after main header
+                    $salt = new-object byte[] 8
+                    $n = $fs.read($salt, 0, 8)
+                    if ($n -ne 8) {throw "$($fs.Name) : file size is too small"}
                     # there is a 8 byte salt before every file header
                     $fs.position -= 8
-                }
-            }
     
-            0x74{
-                $HeadTypeName = 'File'
-                
+                    $this.AesForAll = $this.getAes($this.Ver, $this.password, $salt, $null, $null)    
+                }
+
+                continue
+
+            }elseif($HeadType -eq 0x74){# parse file header 
+
                 $PackSize = [BitConverter]::ToUInt32($buffer, 7)
                 $FileSize  = [BitConverter]::ToUInt32($buffer, 11)
     
@@ -559,158 +439,231 @@ class RAR {
     
                 #get file name
                 $nameSize = [BitConverter]::ToUInt16($buffer, 26)
-                $FullName = $this.RarName4($buffer,  $namePos,  $nameSize)
+                $FullName = $this.RarName4($buffer, $namePos, $nameSize)
                 
     
                 #normal pack ? first pack  ?  middle pack ? last pack ?
                 $PackType = $HeadFlag -band 3
     
                 if ($HeadFlag -band 4){
-                    $IsEncrypt = $true
+                    $IsFileEncrypt = $true
                     $saltPos = $namePos + $nameSize
                     $Salt = new-object byte[] 8
                     [array]::copy($buffer, $saltPos, $Salt, 0, 8)
+
+                    $Aes = $this.getAes($this.Ver, $this.password, $Salt, $null, $null)
                 }
     
                 if (($HeadFlag -band 0xE0) -eq 0xE0){$isDir = $true}
     
                 if ($buffer[25] -ne 0x30) {$IsCompress = $true}
-            }#end of 0x74
-    
-            default{            
-                #other block
+
+                #=============  set entry ===============
+                $result = @{
+                    FullName = $FullName; Size = $FileSize; IsDir = $IsDir;
+                    IsCompress = $IsCompress; IsEncrypt = $IsFileEncrypt; Salt = $Salt; Aes = $Aes;
+                    PackType = $PackType; PackOffset = $PackOffset; PackSize = $PackSize;
+                    rarFileInfo = $file
+                }
+                
+                [rarEntry]$entry = [rarEntry]::new($result)
+                $this.Entries += $entry
+
+            }else{# other header
                 if ($HeadFlag -band 0x8000){ 
                     $PackSize = [BitConverter]::ToUInt32($buffer, 7)
                 }
-            }#end of default
-        }#end of switch
+            }
 
-        return [PSCustomObject]@{
-            HeadTypeName = $HeadTypeName; IsEncrypt = $IsEncrypt; Salt = $Salt
-            PackType = $PackType; PackOffset = $PackOffset; PackSize = $PackSize
-            FullName = $FullName; FileSize = $FileSize; IsCompress = $IsCompress
-            IsDir = $IsDir; KDFcount = $KDFcount; iv = $iv; checkValue = $checkValue
-            FileLinkType = $FileLinkType; targetName = $targetName
-        }
+            #Is this block  the last block need to be processed  ? 
+            $PackEnd = $PackOffset + $PackSize
+            switch -w  ($PackType) {
+                #First pack  or Middle pack
+                #no block after this block  need to be processed
+                [23]{return}
+    
+                [01]{ # normal pack  or last pack
+                    
+                    if ($PackEnd -gt $fs.length) {
+                        return
+                    }else{
+                        $fs.Position = $PackEnd
+                    }
+                }
+                default{$fs.Position = $PackEnd}
+            }
+
+
+        }#end of while
     }
 
-    [PSCustomObject]getHeader5($fs, [byte[]]$buffer, [IO.FileStream]$fs0){
-    
-        $HeadTypeName = $IsEncrypt = $Salt = 
-        $PackType = $PackOffset = $PackSize =
-        $FullName = $FileSize = $IsCompress = $IsDir =
-        $KDFcount = $iv = $checkValue = $FileLinkType = $targetName = $false
-    
-        #Read CRC
-        $n = $fs.read($buffer, 0, 4)
-        if ($n -lt 4) {throw "$($fs.Name) : file size is too small"}
-    
-        #Read HeadSize
-        $n = $fs.read($buffer, 0, 3)
-        if ($n -lt 3) {throw "$($fs.Name) : file size is too small"}
-    
-        $bPos = 0
-        $HeadSize = $this.getVint($buffer, [ref]$bPos)
+    [void]setEntries5($fs, [byte[]]$buffer, [IO.FileInfo]$file){
 
-        #crypto stream can't change position(move back)
-        $n1 = $n - $bPos
-        #[array]::Copy($buffer, $bPos, $buffer, 0, $n1)
-        for ($i = 0; $i -lt $n1; $i++){
-            $buffer[$i] = $buffer[$bPos+$i]
-        }
-        #Read Header into buffer
-        $n = $fs.read($buffer, $n1, $HeadSize - $n1)
-        if ($n -lt $HeadSize - $n1) {throw "$($fs.Name) : file size is too small"}
-        $bPos = 0
-    
-        #=============after reading  header into buffer===============
-        if ($fs0 -ne $null){ # rar header is encrypted
-            $PackOffset = $fs0.position
-        }else{
-            $PackOffset = $fs.position
-        }
+
+        #$FileLinkType = $targetName = $false
         
-        #Read HeadType  HeadFlag
-        $HeadType = $this.getVint($buffer, [ref]$bPos)
+
+        $prev_HeadType = 0
+        $fs0 = $null
+        while ($fs.Position -lt $fs.length){
+        
+            $FullName = $FileSize = $IsDir = 
+            $IsCompress = $IsFileEncrypt = 
+            $PackType = $PackOffset = $PackSize = $false
+
+            $Salt = $Aes = $null
+
+            if ($this.IsHeadEncrypt){
+                $iv = new-object byte[] 16
+                $n = $fs.read($iv, 0, 16)
+                if ($n -ne 16) {throw "$($fs.Name) : file size is too small"}
+        
+                $this.AesForAll.IV = $iv
     
-        $HeadFlag = $this.getVint($buffer, [ref]$bPos)
-    
-        switch -w ($HeadType){
-            #assume that data area is not exist in main block
-            1{$HeadTypeName = 'Main'}
-    
-            [23]{# File header or Service header
+                $fs0 = $fs
+                $fs = new-object System.Security.Cryptography.CryptoStream (
+                    $fs0, $this.AesForAll.CreateDecryptor(), 0
+                )
+            }
+
+            #Read CRC
+            $n = $fs.read($buffer, 0, 4)
+            if ($n -ne 4) {throw "$($fs.Name) : file size is too small"}
+        
+            #Read HeadSize
+            $n = $fs.read($buffer, 0, 3)
+            if ($n -ne 3) {throw "$($fs.Name) : file size is too small"}
+        
+            $bPos = 0
+            $HeadSize = $this.getVint($buffer, [ref]$bPos)
+
+            #crypto stream can't change position(move back)
+            $n1 = $n - $bPos
+            #[array]::Copy($buffer, $bPos, $buffer, 0, $n1)
+            for ($i = 0; $i -lt $n1; $i++){
+                $buffer[$i] = $buffer[$bPos+$i]
+            }
+            #Read Header into buffer
+            $n = $fs.read($buffer, $n1, $HeadSize - $n1)
+            if ($n -lt $HeadSize - $n1) {throw "$($fs.Name) : file size is too small"}
+        
+            if ($this.IsHeadEncrypt){
+                $fs = $null
+                $fs = $fs0
+            }
+            $PackOffset = $fs.position
+
+            #================================================
+            $bPos = 0
+            #Read HeadType  HeadFlag
+            $HeadType = $this.getVint($buffer, [ref]$bPos)
+        
+            $HeadFlag = $this.getVint($buffer, [ref]$bPos)
+
+            if ($prev_HeadType -eq 0 -and $HeadType -notIn (1, 4)){
+                #first header must be Archive encryption header or main header
+                throw "$($fs.Name) : Main header error"
+            
+            }elseif($prev_HeadType -eq 4 -and $HeadType -ne 1){
+                #after Archive encryption header must be main header
+                throw "$($fs.Name) : Main header error"
+            
+            }else{
+                $prev_HeadType = $HeadType
+            }
+        
+            if ($HeadType -eq 4){# Archive encryption header
+                #Encryption version
+                $this.getVint($buffer, [ref]$bPos) > $null
+
+                #Encryption flags
+                $eFlag = $this.getVint($buffer, [ref]$bPos)
+
+                #KDF count
+                $KDFcount = $buffer[$bPos++]
+
+                #salt
+                $Salt = new-object byte[] 16
+                [array]::Copy($buffer, $bPos, $Salt, 0, 16)
+                $bPos += 16
+
+                #Check value
+                $checkValue = $null
+                if ($eFlag -band 1){
+                    $checkValue = new-object byte[] 12
+                    [array]::Copy($buffer, $bPos, $checkValue, 0, 12)
+                    $bPos += 12
+                }
+
+                $this.IsHeadEncrypt = $true
+                $this.AesForAll = $this.getAes($this.Ver, $this.password, $Salt, $KDFcount, $checkValue)
+
+            }elseif ($HeadType -eq 2){# file header
                 #Extra area size
                 if ($HeadFlag -band 1) {
                     $this.getVint($buffer, [ref]$bPos) > $null 
                 }
-    
+
                 #Data area size
                 $PackSize = 0
                 if ($HeadFlag -band 2) {
                     $PackSize = $this.getVint($buffer, [ref]$bPos)
                 }
-    
-                if ($_ -eq 2) {
-                    $HeadTypeName = 'File'
-                }else{#service header
-                    $HeadTypeName = 'Service'
-                }
-    
+
                 #File flags
                 $FileFlags = $this.getVint($buffer, [ref]$bPos)
-                if ($FileFlags -band 1){$isDir = $true}
-    
+                if ($FileFlags -band 1){$IsDir = $true}
+
                 #Unpacked size
                 $FileSize = $this.getVint($buffer, [ref]$bPos)
-    
+
                 #Attributes
                 $this.getVint($buffer, [ref]$bPos) > $null
-    
+
                 #mtime
                 if ($FileFlags -band 2) {$bPos +=4}
-    
+
                 #Data CRC32
                 if ($FileFlags -band 4) {$bPos +=4}
-    
+
                 #Compression information
                 if (  ($this.getVint($buffer, [ref]$bPos)) -band 0x0380) {$IsCompress = $true}
-    
+
                 #Host OS
                 $this.getVint($buffer, [ref]$bPos) > $null
-    
-    
+
                 #file name length
                 $nameSize = $this.getVint($buffer, [ref]$bPos)
-    
+
                 #get file name
-                $FullName = [System.Text.Encoding]::UTF8.GetString($buffer,$bPos,$nameSize)
+                $FullName = [System.Text.Encoding]::UTF8.GetString($buffer, $bPos, $nameSize)
                 $bPos += $nameSize
-    
+
                 #normal pack ? first pack  ?  middle pack ? last pack ?
                 $PackType = ($HeadFlag -shr 3) -band 3
-    
+
                 #encrypt ?  read extra area
                 while ($bPos -lt $HeadSize){
                     $recordSize = $this.getVint($buffer, [ref]$bPos)
                     $recordEnd = $bPos + $recordSize
-    
+
                     if ($recordEnd -gt $HeadSize){break}
                                     
                     #record type
                     $recordType = $this.getVint($buffer, [ref]$bPos)
+
                     if ($recordType -eq 1){#File encryption record
-                        $IsEncrypt = $true
+                        $IsFileEncrypt = $true
                         
                         #Encryption version
                         $this.getVint($buffer, [ref]$bPos) > $null
-    
+
                         #Encryption flags
                         $eFlag = $this.getVint($buffer, [ref]$bPos)
-    
+
                         #KDF count
                         $KDFcount = $buffer[$bPos++]
-    
+
                         #salt
                         $Salt = new-object byte[] 16
                         [array]::Copy($buffer, $bPos, $Salt, 0, 16)
@@ -720,14 +673,18 @@ class RAR {
                         $iv = new-object byte[] 16
                         [array]::Copy($buffer, $bPos, $iv, 0, 16)
                         $bPos += 16
-    
+
                         #Check value
+                        $checkValue = $null
                         if ($eFlag -band 1){
                             $checkValue = new-object byte[] 12
                             [array]::Copy($buffer, $bPos, $checkValue, 0, 12)
                             $bPos += 12
                         }
-    
+
+                        $Aes = $this.getAes($this.Ver, $this.password, $Salt, $KDFcount, $checkValue)
+                        $Aes.IV = $iv
+
                     }elseif($recordType -eq 5){#File system redirection record
                         $redirection = $this.getVint($buffer, [ref]$bPos)
                         $flag1 = $this.getVint($buffer, [ref]$bPos)
@@ -746,49 +703,55 @@ class RAR {
                     }
                     $bPos = $recordEnd
                 }#end of while
-            }#end of [23]
-    
-            4{# Archive encryption header
-                $HeadTypeName = 'Encryption'
-                $IsEncrypt = $true
 
-                #Encryption version
-                $this.getVint($buffer, [ref]$bPos) > $null
-    
-                #Encryption flags
-                $eFlag = $this.getVint($buffer, [ref]$bPos)
-    
-                #KDF count
-                $KDFcount = $buffer[$bPos++]
-    
-                #salt
-                $Salt = new-object byte[] 16
-                [array]::Copy($buffer, $bPos, $Salt, 0, 16)
-                $bPos += 16
-    
-                #Check value
-                if ($eFlag -band 1){
-                    $checkValue = new-object byte[] 12
-                    [array]::Copy($buffer, $bPos, $checkValue, 0, 12)
-                    $bPos += 12
+                #=============  set entry ===============
+                $result = @{
+                    FullName = $FullName; Size = $FileSize; IsDir = $IsDir;
+                    IsCompress = $IsCompress; IsEncrypt = $IsFileEncrypt; Salt = $Salt; Aes = $Aes;
+                    PackType = $PackType; PackOffset = $PackOffset; PackSize = $PackSize;
+                    rarFileInfo = $file
                 }
-            }
+                
+                [rarEntry]$entry = [rarEntry]::new($result)
+                $this.Entries += $entry
 
-            5{# End of archive header
-            }
+            
+            
+            }elseif ($HeadType -eq 3){# service header
+                #Extra area size
+                if ($HeadFlag -band 1) {
+                    $this.getVint($buffer, [ref]$bPos) > $null 
+                }
 
-            default{
+                #Data area size
+                $PackSize = 0
+                if ($HeadFlag -band 2) {
+                    $PackSize = $this.getVint($buffer, [ref]$bPos)
+                }
+            }elseif ($HeadType -notIn (1, 5)){
                 write-host "unknown header type : $HeadType"
             }
-        }# end of switch
-    
-        return [PSCustomObject]@{
-            HeadTypeName = $HeadTypeName; IsEncrypt = $IsEncrypt; Salt = $Salt
-            PackType = $PackType; PackOffset = $PackOffset; PackSize = $PackSize
-            FullName = $FullName; FileSize = $FileSize; IsCompress = $IsCompress
-            IsDir = $IsDir; KDFcount = $KDFcount; iv = $iv; checkValue = $checkValue
-            FileLinkType = $FileLinkType; targetName = $targetName
-        }
+
+            #Is this block  the last block need to be processed  ? 
+            $PackEnd = $PackOffset + $PackSize
+            switch -w  ($PackType) {
+                #First pack  or Middle pack
+                #no block after this block  need to be processed
+                [23]{return}
+
+                [01]{ # normal pack  or last pack
+                    if ($PackEnd -gt $fs.length) {
+                        return
+                    }else{
+                        $fs.Position = $PackEnd
+                    }
+                }
+                default{$fs.Position = $PackEnd}
+            }
+
+        }#end of while
+
+
     }
 
     [string]RarName4([byte[]]$buffer, [uint32]$namePos, [uint32]$nameSize){
@@ -893,25 +856,24 @@ class RAR {
             $seedNew = New-Object byte[] $seed.length
             [array]::Copy($seed, 0, $seedNew, 0, $seed.length)
         
-            [byte[]]$iv = @(0) * 16
+            [byte[]]$iv = @(0) * 16            
             if ( ! ('SHA1SP.SHA1SP' -as [type])){Add-Type -TypeDef ([RAR]::SHA1SPdef) }
-            $sha1 = new-object SHA1SP.SHA1SP $true
+            $sha1 = new-object SHA1SP.SHA1SP
         
             for($i = 0; $i -lt 16; $i++){
                 for($j = 0; $j -lt 0x4000; $j++){
                     $count = [System.BitConverter]::GetBytes($i*0x4000 + $j)
-                    $sha1.TransformBlock($seedNew, 0, $seedNew.length) > $null
-                    $sha1.TransformBlock($count, 0, 3) > $null
+                    $sha1.update($seedNew)
+                    $sha1.update($count[0..2])
                     if ($j -eq 0){
-                        $hash = $sha1.TransformFinalBlock($null, 0, 0)
+                        $hash = $sha1.digest()
                         $iv[$i] = $hash[19]
                     }
                 }
             }
-            # $hash = $sha1.HashFinal()
-            $hash = $sha1.TransformFinalBlock($null, 0, 0)
+            $hash = $sha1.digest()
             [byte[]]$key = $hash[3..0] + $hash[7..4] + $hash[11..8] + $hash[15..12]
-    
+
         }elseif ($Ver -eq 5){
 
             if ($null -ne $this.AesTable."$checkValue"){
@@ -990,7 +952,7 @@ class RAR {
 
         if ($Ver -eq 4){
             $this.AesTable."$salt" = $Aes
-        }else{
+        }else{# $Ver -eq 5
             $this.AesTable."$checkValue" = $Aes
         }
         
@@ -1003,7 +965,7 @@ class RAR {
         
         while ($buffer[$bPos.Value++] -band 0x80) {}
     
-        if ( ($bPos.Value - $bPosOld) -gt 9 ){throw 'Vint : too many bytes'}  # 7 * 9 = 63
+        if ( ($bPos.Value - $bPosOld) -gt 9 ){throw 'Vint : too many bytes'}  # 7 * 9 = 63 (bits)
     
         [uint64]$data = $n = 0
     
@@ -1017,34 +979,47 @@ class RAR {
 }
 
 class rarEntry{
-    [string]$Name = ''
     [string]$FullName = ''
+    [string]$Name = ''
     [uint64]$Size = 0
     [bool]$IsDir = $false
 
     [bool]$IsCompress = $false
     [bool]$IsEncrypt = $false
-    [byte[]]$iv0 = @()
+    [bool]$Salt = @()
     [System.Security.Cryptography.AesCryptoServiceProvider]$Aes = $null
+    [byte[]]$iv0 = @()
 
-    [IO.FileInfo]$rarFileInfo = $null
     [byte]$PackType = 0
     [uint64]$PackOffset = 0
     [uint64]$PackSize = 0
     [uint64]$ActualPackSize = 0
 
+    [IO.FileInfo]$rarFileInfo = $null
+
     rarEntry([PSCustomObject]$result){
         $this.FullName = $result.FullName
         $this.Name = Split-Path $result.FullName -Leaf
-        $this.Size = $result.FileSize
+        $this.Size = $result.Size
         $this.IsDir = $result.IsDir
 
         $this.IsCompress = $result.IsCompress
         $this.IsEncrypt = $result.IsEncrypt
+        $this.Salt = $result.Salt
+        $this.Aes = $result.Aes
+        if ($null -ne $this.Aes){$this.iv0 = $this.Aes.IV}
         
         $this.PackType = $result.PackType
         $this.PackOffset = $result.PackOffset
         $this.PackSize = $result.PackSize
+
+        $this.rarFileInfo = $result.rarFileInfo
+
+        if ($this.PackOffset + $this.PackSize -gt $this.rarFileInfo.length) {
+            $this.ActualPackSize = $this.rarFileInfo.length - $this.PackOffset
+        }else{
+            $this.ActualPackSize = $this.PackSize
+        }
     }
 }
 
@@ -1078,7 +1053,12 @@ class File{
     #>
 
     File([rarEntry]$entry){
-        $this.FullName = $entry.FullName
+        #
+        if ($script:dontMakeFolder){
+            $this.FullName = Split-Path $entry.FullName -Leaf
+        }else{
+            $this.FullName = $entry.FullName
+        }
         $this.fileSize = $entry.Size
 
         if($entry.IsDir){
@@ -1107,6 +1087,7 @@ class File{
             for ($i = 0; $i -lt $entries.Count; $i++){
 
                 if ($entries[$i].IsCompress){continue}
+                if ($script:dontMakeFolder -and $entries[$i].IsDir){continue}
                 [File]::makeFile($entries, [ref]$i, $FsTable)
             }
         )
@@ -1583,8 +1564,17 @@ RarVolume([string]$rarFilePath){
         $endName = Split-Path $file.FullName -Leaf
         $this.FileNameAdd($parent, 0, $endName, $file)
     }
+    <#
+    pushd (Split-Path $script:rarFilePath)
+    foreach ($Key in $this.fileIds.Keys){
+        $data = ConvertTo-Json $this.fileIds[$Key] -Depth 3
+        $data >> MountData.txt
+        
+    }
     
-
+    #sc -Path MountData.txt -Value $data  -enc UTF8
+    popd
+    #>
 }
 
 [File]makeFolder([string]$FolderPath){
