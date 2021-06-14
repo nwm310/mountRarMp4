@@ -105,89 +105,83 @@ class RAR {
     namespace SHA1SP {
     
         public class SHA1SP {
-            private uint[] H = new uint[5];
+            private uint[] h = new uint[5];
             private uint[] w = new uint[80];
             private byte[] buffer = new byte[64];
-            private int bufferCount = 0;
-            private long processCount = 0;
+            private long count = 0;
     
             public SHA1SP (){
-                H[0] = 0x67452301;
-                H[1] = 0xEFCDAB89;
-                H[2] = 0x98BADCFE;
-                H[3] = 0x10325476;
-                H[4] = 0xC3D2E1F0;
+                h[0] = 0x67452301;
+                h[1] = 0xEFCDAB89;
+                h[2] = 0x98BADCFE;
+                h[3] = 0x10325476;
+                h[4] = 0xC3D2E1F0;
             }
     
             public void Reset (){
-                H[0] = 0x67452301;
-                H[1] = 0xEFCDAB89;
-                H[2] = 0x98BADCFE;
-                H[3] = 0x10325476;
-                H[4] = 0xC3D2E1F0;
+                h[0] = 0x67452301;
+                h[1] = 0xEFCDAB89;
+                h[2] = 0x98BADCFE;
+                h[3] = 0x10325476;
+                h[4] = 0xC3D2E1F0;
     
-                processCount = 0;
-                bufferCount = 0;
+                count = 0;
             }
     
             public void update(byte[] data){
                 if (null == data){return;}
     
+                int bufferCount = (int)count & 0x3f; 
                 long start = 0;
                 long Len = data.Length;
                 long end = start + Len;
+
+                count += Len;
                 bool afterFirstBlock = false;
-    
-                int n = 0;
+
                 if (bufferCount != 0){
-                    n = 64 - bufferCount;
+                    int n = 64 - bufferCount;
     
                     if (Len < n){
                         System.Array.Copy(data, 0, buffer, bufferCount, Len);
-                        bufferCount += (int)Len;
                         return;
     
                     }else{
                         System.Array.Copy(data, 0, buffer, bufferCount, n);
                         process64(buffer, 0);
-                        processCount += 64;
-    
-                        bufferCount = 0;
+
                         start += n;
                         afterFirstBlock = true;
                     }
     
                 }
-    
-                byte[] w4bytes = new byte[4];
+
                 while (start + 64 <= end) {
                     process64(data, start);
-    
+
                     if (afterFirstBlock){
-                        for (int i = 0; i < 16; i++){
-                            w4bytes[0] = (byte)(w[64+i]);
-                            w4bytes[1] = (byte)(w[64+i] >> 8);
-                            w4bytes[2] = (byte)(w[64+i] >> 16);
-                            w4bytes[3] = (byte)(w[64+i] >> 24);
-                            System.Array.Copy(w4bytes, 0, data, start + i*4, 4);
+                        for (int i=0, j=64; j < 80; i+=4, j++){
+                            data[start + i] = (byte)(w[j]);
+                            data[start + i + 1] = (byte)(w[j] >> 8);
+                            data[start + i + 2] = (byte)(w[j] >> 16);
+                            data[start + i + 3] = (byte)(w[j] >> 24);
                         }
                     }
-    
-                    processCount += 64;
+
                     start += 64;
                     afterFirstBlock = true;
                 }
     
                 if (start < end){
                     System.Array.Copy(data, start, buffer, 0, end - start);
-                    bufferCount = (int)(end - start);
                 }
     
                 return;
             }
     
             public byte[] digest(){
-                if (bufferCount == 0 && processCount == 0){return null;}
+                if (count == 0){return null;}
+                int bufferCount = (int)count & 0x3f;
     
                 int finalBlockLen = 64;
                 if (bufferCount + 1 + 8 > 64){finalBlockLen = 128;}
@@ -206,7 +200,7 @@ class RAR {
                     finalBlock[i] = 0;
                 }
     
-                ulong TotalCount = (ulong)((processCount + bufferCount) * 8);
+                ulong TotalCount = (ulong)(count * 8);
                 finalBlock[i++] = (byte)(TotalCount >> 56);
                 finalBlock[i++] = (byte)(TotalCount >> 48);
                 finalBlock[i++] = (byte)(TotalCount >> 40);
@@ -216,9 +210,9 @@ class RAR {
                 finalBlock[i++] = (byte)(TotalCount >>  8);
                 finalBlock[i] = (byte)(TotalCount);
     
-                uint[] HCopy = new uint[5];
+                uint[] hCopy = new uint[5];
                 for (i = 0; i < 5; i++){
-                    HCopy[i] = H[i];
+                    hCopy[i] = h[i];
                 }
     
                 process64(finalBlock, 0);
@@ -229,14 +223,14 @@ class RAR {
                 
                 byte[] result = new byte[20];
                 for (i = 0; i < 5; i++){
-                    result[i*4]   = (byte)(H[i] >> 24);
-                    result[i*4+1] = (byte)(H[i] >> 16);
-                    result[i*4+2] = (byte)(H[i] >>  8);
-                    result[i*4+3] = (byte)(H[i]);
+                    result[i*4]   = (byte)(h[i] >> 24);
+                    result[i*4+1] = (byte)(h[i] >> 16);
+                    result[i*4+2] = (byte)(h[i] >>  8);
+                    result[i*4+3] = (byte)(h[i]);
                 }
 
                 for (i = 0; i < 5; i++){
-                    H[i] = HCopy[i];
+                    h[i] = hCopy[i];
                 }
     
                 return result;
@@ -256,11 +250,11 @@ class RAR {
                     w[i] = (temp << 1) | (temp >> 31);
                 }
                 
-                uint a = H[0];
-                uint b = H[1];
-                uint c = H[2];
-                uint d = H[3];
-                uint e = H[4];
+                uint a = h[0];
+                uint b = h[1];
+                uint c = h[2];
+                uint d = h[3];
+                uint e = h[4];
     
             
                 uint f = 0;
@@ -269,6 +263,7 @@ class RAR {
                     if (i < 20){
                         f = (b & c) | ((~ b) & d);
                         k = 0x5A827999;
+                        
                     }else if (i < 40){
                         f = b ^ c ^ d;
                         k = 0x6ED9EBA1;
@@ -290,11 +285,11 @@ class RAR {
                     a = temp;
                 }
     
-                H[0] += a;
-                H[1] += b;
-                H[2] += c;
-                H[3] += d;
-                H[4] += e;
+                h[0] += a;
+                h[1] += b;
+                h[2] += c;
+                h[3] += d;
+                h[4] += e;
     
                 return;
             }
@@ -852,7 +847,8 @@ class RAR {
             $this.password = $password
             $seed = [System.Text.Encoding]::Unicode.GetBytes($password) + $salt
             
-            # in powershell , must : New-Object to create space , then copy seed to space
+            # when password length > 28
+            # must : New-Object to create space , then copy seed to space
             $seedNew = New-Object byte[] $seed.length
             [array]::Copy($seed, 0, $seedNew, 0, $seed.length)
         
@@ -860,11 +856,12 @@ class RAR {
             if ( ! ('SHA1SP.SHA1SP' -as [type])){Add-Type -TypeDef ([RAR]::SHA1SPdef) }
             $sha1 = new-object SHA1SP.SHA1SP
         
+            $n = 0
             for($i = 0; $i -lt 16; $i++){
                 for($j = 0; $j -lt 0x4000; $j++){
-                    $count = [System.BitConverter]::GetBytes($i*0x4000 + $j)
+                    $n4bytes = [System.BitConverter]::GetBytes($n++)
                     $sha1.update($seedNew)
-                    $sha1.update($count[0..2])
+                    $sha1.update($n4bytes[0..2])
                     if ($j -eq 0){
                         $hash = $sha1.digest()
                         $iv[$i] = $hash[19]
@@ -986,7 +983,7 @@ class rarEntry{
 
     [bool]$IsCompress = $false
     [bool]$IsEncrypt = $false
-    [bool]$Salt = @()
+    [byte[]]$Salt = @()
     [System.Security.Cryptography.AesCryptoServiceProvider]$Aes = $null
     [byte[]]$iv0 = @()
 
