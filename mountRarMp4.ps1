@@ -353,7 +353,7 @@ class RAR {
 
     [void]setEntries4($fs, [byte[]]$buffer, [IO.FileInfo]$file){
                 
-        $prev_HeadType = 0
+        $afterMain = $false
         $fs0 = $null
         while ($fs.Position -lt $fs.length){
 
@@ -362,8 +362,7 @@ class RAR {
             $PackType = $PackOffset = $PackSize = $false
 
             $Salt = $Aes = $null
-
-            if ($this.IsHeadEncrypt){
+            if ($afterMain -and $this.IsHeadEncrypt){
                 # salt already read
                 # all salts are the same.  skip it
                 $fs.position += 8
@@ -385,20 +384,19 @@ class RAR {
             $n1 = $fs.read($buffer, 7, $n)
         
             if ($n1 -ne $n) {throw "$($fs.Name) : file size is too small"}
-            if ($this.IsHeadEncrypt){
+            if ($afterMain -and $this.IsHeadEncrypt){
                 $fs = $null
                 $fs = $fs0
             }
             $PackOffset = $fs.position
             #========================================================
-            if ($prev_HeadType -eq 0 -and $HeadType -ne 0x73){
+            if ($afterMain -eq $false -and $HeadType -ne 0x73){
                 #first header must be main header
                 throw "$($fs.Name) : Main header error"
-            }else{
-                $prev_HeadType = $HeadType
             }
 
             if ($HeadType -eq 0x73){# parse main header
+                $afterMain = $true
                 if ($HeadFlag -band 0x80){
                     $this.IsHeadEncrypt = $true
 
@@ -409,7 +407,8 @@ class RAR {
                     # there is a 8 byte salt before every file header
                     $fs.position -= 8
     
-                    $this.AesForAll = $this.getAes($this.Ver, $this.password, $salt, $null, $null)    
+                    $this.AesForAll = $this.getAes($this.Ver, $this.password, $salt, $null, $null)
+
                 }
 
                 continue
@@ -508,7 +507,7 @@ class RAR {
 
             $Salt = $Aes = $null
 
-            if ($this.IsHeadEncrypt){
+            if ($prev_HeadType -ne 0 -and $this.IsHeadEncrypt){
                 $iv = new-object byte[] 16
                 $n = $fs.read($iv, 0, 16)
                 if ($n -ne 16) {throw "$($fs.Name) : file size is too small"}
@@ -542,7 +541,7 @@ class RAR {
             $n = $fs.read($buffer, $n1, $HeadSize - $n1)
             if ($n -lt $HeadSize - $n1) {throw "$($fs.Name) : file size is too small"}
         
-            if ($this.IsHeadEncrypt){
+            if ($prev_HeadType -ne 0 -and $this.IsHeadEncrypt){
                 $fs = $null
                 $fs = $fs0
             }
@@ -1263,9 +1262,9 @@ class File{
                         $current.fs.position = $current.fsOffset
                         [void]$current.fs.read($blockEncrypted, $n, 16 - $n)
     
-                        $current.Aes.IV = $blockIV
+                        $this.Aes.IV = $blockIV
     
-                        [void]$current.Aes.CreateDecryptor().TransformBlock($blockEncrypted, 0, 16, $blockOut, 0)
+                        [void]$this.Aes.CreateDecryptor().TransformBlock($blockEncrypted, 0, 16, $blockOut, 0)
     
                         $current.iv0 = $blockEncrypted
                         $current.MountFileOffset += 16 - $n
